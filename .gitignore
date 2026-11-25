@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Notebooks and editors
+.ipynb_checkpoints/
+.idea/
+.vscode/
+*.swp
+
+# Environments
+.venv/
+venv/
+env/
+
+# Datasets, weights, and experiment outputs
+data/
+datasets/
+checkpoints/
+weights/
+runs/
+outputs/
+*.pth
+*.pt
+*.ckpt
+*.tar
+*.npy
+*.npz
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

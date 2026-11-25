@@ -1,0 +1,5 @@
+# Install the CUDA-compatible torch and torchvision builds separately:
+# https://pytorch.org/get-started/locally/
+numpy
+opencv-python
+pandas
