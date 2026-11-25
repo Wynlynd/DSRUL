@@ -3,11 +3,21 @@
 Reference implementation of **DSRUL: A Novel Adaptive Dual-Stream Relative
 Uncertainty Learning Method for Facial Expression Recognition**.
 
-> **Status:** this public snapshot contains the corrected RAF-DB training path
-> for AUEM, DSRUC, and CCAR. Focused tests and development-time mini-batch
-> checks have been completed, but full-dataset training and the numerical
-> results reported in the manuscript have not yet been reproduced from this
-> repository snapshot.
+> **Version:** `2.0.0-dev` (Version 2 development)
+>
+> **Branch:** `version-2-paper-alignment`
+>
+> **Stable baseline:** [`main@0d5f3a2`](https://github.com/Wynlynd/DSRUL/tree/0d5f3a2d11d151d90ebb40f9462cead7a292b350)
+>
+> **Changes:** [CHANGELOG.md](CHANGELOG.md)
+
+> **Status:** V2 aligns the AUEM importance path with Equation (1), adds
+> equation-level regression tests, and versions the checkpoint contract. This
+> snapshot contains the corrected RAF-DB training path
+> for AUEM, DSRUC, and CCAR. All 17 focused V2 tests, source compilation, and
+> CLI checks pass in the environment recorded in the changelog. Full-dataset
+> training and the numerical results reported in the manuscript have not yet
+> been reproduced from this repository snapshot.
 
 ## Overview
 
@@ -15,11 +25,12 @@ DSRUL targets facial expression recognition with noisy or ambiguous labels.
 The current RAF-DB implementation combines three components:
 
 - **AUEM (Attentional Uncertainty Estimation Module)** predicts a sample
-  importance score from normalized pooled features. The score defines the two
-  batch regions and contributes an importance-separation regularizer.
+  importance score from the per-sample min-max-normalized `mu` embedding, as
+  specified by Equation (1). The score defines the two batch regions and
+  contributes an importance-separation regularizer.
 - **DSRUC (Dual-Stream Relative Uncertainty Comparison)** pairs differently
   labeled samples across those regions, mixes their embeddings using the
-  model's independent uncertainty branch, and trains the mixed representation
+  model's independent uncertainty vectors, and trains the mixed representation
   against both source labels.
 - **CCAR (Cluster-Contrastive Adaptive Relabeling)** maintains class
   prototypes, measures intra/inter-class geometric inconsistency, and combines
@@ -34,7 +45,7 @@ The original dataset labels are not permanently overwritten.
 | --- | --- |
 | RAF-DB, 7-class training | Supported by the primary entrypoint |
 | AUEM + DSRUC + CCAR | Connected in the primary training objective |
-| CCAR unit tests | Included |
+| AUEM/objective/CCAR/checkpoint tests | Included |
 | FERPlus/AffectNet corrected paths | Not yet integrated |
 | Standalone evaluation CLI | Not yet included |
 | Full paper-result reproduction | Pending |
@@ -47,6 +58,8 @@ values are not traceable to versioned run artifacts.
 
 ```text
 .
+|-- VERSION
+|-- CHANGELOG.md
 |-- README.md
 |-- requirements.txt
 |-- docs/
@@ -54,10 +67,10 @@ values are not traceable to versioned run artifacts.
 `-- src/
     |-- train_rafdb.py       # Primary RAF-DB training entrypoint
     |-- resnet.py            # ResNet-18, uncertainty, and importance branches
-    |-- iresnet.py           # Optional IResNet-18 backbone
     |-- ccar.py              # Prototype, threshold, relabeling, and CCAR loss
+    |-- objectives.py        # Equation-aligned AUEM/DSRUC target helpers
     |-- image_utils.py       # Image augmentation helpers
-    `-- test_ccar.py         # Focused CCAR tests
+    `-- test_*.py            # Formula, model, checkpoint, and CCAR tests
 ```
 
 See [implementation notes](docs/implementation-notes.md) for the exact active
@@ -66,7 +79,8 @@ loss definitions and manuscript-to-code decisions.
 ## Requirements
 
 The training entrypoint currently uses CUDA and `DataParallel`, so a
-CUDA-capable PyTorch environment is required for training. Install a PyTorch
+CUDA-capable PyTorch environment and Python 3.9 or newer are required for
+training. Install a PyTorch
 and torchvision build compatible with your CUDA driver from the
 [official PyTorch instructions](https://pytorch.org/get-started/locally/), then
 install the remaining packages:
@@ -76,7 +90,8 @@ pip install -r requirements.txt
 ```
 
 Exact Python, PyTorch, CUDA, and GPU versions used for paper-grade reproduction
-will be added with the reproducibility release. The CCAR tests can run on CPU.
+will be added with the reproducibility release. The test suite can run on CPU
+and also exercises CUDA paths when CUDA is available.
 
 ## RAF-DB Preparation
 
@@ -112,7 +127,7 @@ and clean-validation split. Defaults are `--val_ratio 0.1` and
 
 ## Pretrained Weights
 
-Pretrained weights are not included. Pass a compatible backbone checkpoint:
+Pretrained weights are not included. Pass a compatible model checkpoint:
 
 ```text
 --pretrained /path/to/ijba_res18_naive.pth.tar
@@ -120,8 +135,10 @@ Pretrained weights are not included. Pass a compatible backbone checkpoint:
 
 Omit `--pretrained` to use random initialization. Random initialization is a
 supported code path, but it is not established as the manuscript reproduction
-setting. Record the source and checksum of any pretrained checkpoint used in
-reported experiments.
+setting. Warm starts load exact name/shape matches for the trunk and embedding
+path, while deliberately skipping the internal classifier, AUEM importance
+head, and uncertainty head. Record the source and checksum of any pretrained
+checkpoint used in reported experiments.
 
 ## Training
 
@@ -152,6 +169,10 @@ Important method defaults:
 | `--relabel_epoch` | `8` | First epoch with batch-local relabeling |
 | `--margin_1` | `0.5` | AUEM regularization offset |
 
+The training batch sampler retains all samples and merges a tail that is too
+small for `BatchNorm1d` into the preceding batch. The configured batch size
+must provide at least two samples per visible CUDA device.
+
 Use `python src/train_rafdb.py --help` for all data, optimizer, scheduler,
 sampling, augmentation, EMA, and checkpoint options.
 
@@ -171,9 +192,20 @@ python src/train_rafdb.py \
   --save_dir runs/rafdb-noise-01
 ```
 
-The checkpoint restores the backbone, external classifier, CCAR state,
-optimizer, scheduler, and epoch. RNG and sampler state are not currently saved,
-so a resumed run is not bitwise identical to an uninterrupted run.
+V2 checkpoints restore the backbone, external classifier, CCAR state,
+optimizer, scheduler, epoch, and EMA history when enabled. They carry a format
+version and method contract (`normalized_mu`, embedding dimension,
+`pairwise_normalized_vector_mean`, and ResNet-18). V1 checkpoints cannot be
+resumed because the importance and uncertainty head shapes changed; use
+`--pretrained` for the restricted warm start described above. Resume rejects
+changes to behavior-defining data, method, optimizer, scheduler, augmentation,
+and EMA settings. Resume-location/output controls, the historical warm-start
+source field, early-stop target, and the final test-evaluation switch are
+excluded from that equality check. The total `--epochs` plan remains fixed
+because it defines the cosine scheduler's `T_max`; V2 resume is therefore for
+continuing an interrupted run within its original epoch plan, not silently
+extending that plan. RNG and sampler state are not currently saved, so a
+resumed V2 run is still not bitwise identical to an uninterrupted run.
 
 ## Evaluation and Outputs
 
@@ -195,16 +227,18 @@ are not yet implemented.
 
 ## Tests
 
-Run the focused CCAR tests from the repository root:
+Run all paper-alignment and component tests from the repository root:
 
 ```bash
-python src/test_ccar.py
+python -m unittest discover -s src -p "test_*.py" -v
 ```
 
-They cover prototype initialization and EMA updates, missing classes, dynamic
-thresholds, relabel gating, scaled-logit loss behavior, and finite gradients.
-These tests validate component behavior; they do not replace full-dataset
-training or result reproduction.
+They cover the `mu -> normalization -> importance` path, the documented V2
+interpretations of Equations (2)-(6), vector-uncertainty normalization and
+reduction, three-term gradient reach, prototype initialization and EMA, dynamic
+thresholds, relabel ordering, scaled-logit loss behavior, warm-start filtering,
+and V2 checkpoint compatibility. These tests validate component behavior; they
+do not replace full-dataset training or result reproduction.
 
 ## Reproducibility Boundary
 
@@ -220,6 +254,25 @@ training or result reproduction.
 
 No manuscript accuracy should be attributed to this snapshot without the
 matching environment, dataset/noise protocol, checkpoint, seed, and run logs.
+
+## Version History
+
+| Version | Branch/baseline | Main change |
+| --- | --- | --- |
+| `2.0.0-dev` | `version-2-paper-alignment` | Computes AUEM importance from normalized `mu`, restores vector uncertainty for DSRUC, adds regression coverage for the documented V2 interpretations, and adds versioned checkpoints. No paper accuracy is claimed. |
+| V1 baseline | `main@0d5f3a2` | First public RAF-DB path with AUEM, DSRUC, CCAR, validation checkpointing, and explicit reproducibility limits. |
+
+For a new major research line, create
+`version-<major>-<short-description>` (for example,
+`version-3-new-objective`). For later minor or patch releases, use
+`version-<semver>-<short-description>` (for example,
+`version-2.1.0-training-protocol`). Create every branch from the exact preceding
+stable commit or release tag, record that baseline in the changelog, and never
+force-push an older version branch. Every version branch must update `VERSION`,
+this version table, and `CHANGELOG.md` with the exact changes, compatibility
+boundary, validation commands, and remaining limitations. Branch names use
+lowercase ASCII and hyphens. Formal releases also receive an annotated SemVer
+tag; the current V1 state is a baseline commit, not a tagged release.
 
 ## Citation
 

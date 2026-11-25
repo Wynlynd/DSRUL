@@ -1,25 +1,42 @@
 import math
 import numpy as np
 from resnet import resnet18
-from iresnet import iresnet18
 from ccar import ClusterContrastiveRelabeler, ccar_loss
+from objectives import (
+    auem_regularization_loss,
+    ccar_batch_targets,
+    dsruc_loss,
+    split_uncertainty_regions,
+)
 import torch.utils.data as data
 from torchvision import transforms
 import cv2
-import torch.nn.functional as F
-from torch.autograd import Variable
 import pandas as pd
 import os, torch
 import torch.nn as nn
 import image_utils
 import argparse, random
-import pdb
 import json
+from pathlib import Path
 torch.cuda.empty_cache()
 
 # from torchsampler import ImbalancedDatasetSampler
 
-def parse_args():
+CHECKPOINT_FORMAT_VERSION = 2
+IMPORTANCE_SOURCE = 'normalized_mu'
+UNCERTAINTY_REPRESENTATION = 'pairwise_normalized_vector_mean'
+RESUME_MUTABLE_FIELDS = frozenset({
+    'checkpoint', 'pretrained', 'save_dir', 'skip_test_eval',
+    'target_val_accuracy',
+})
+WARM_START_EXCLUDED_PREFIXES = ('alpha.', 'log_var.', 'fc.')
+BASE_RESUME_KEYS = (
+    'implementation_version', 'config', 'iter', 'best_val_accuracy',
+    'model_state_dict', 'fc_state_dict', 'ccar_state_dict',
+    'optimizer_state_dict', 'scheduler_state_dict', 'ema_decay',
+)
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description='Train the DSRUL RAF-DB implementation.')
     parser.add_argument('--raf_path', type=str, required=True,
@@ -40,10 +57,8 @@ def parse_args():
                         help='Skip official-test evaluation during tuning runs.')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Full training checkpoint to resume (model, CCAR, optimizer, and epoch).')
-    parser.add_argument('--backbone', choices=('resnet18', 'iresnet18'), default='resnet18',
-                        help='Backbone architecture.')
     parser.add_argument('--pretrained', type=str, default='',
-                        help='Optional pretrained backbone checkpoint.')
+                        help='Optional model weights for an exact name/shape-compatible warm start.')
     parser.add_argument('--beta', type=float, default=0.2, help='CCAR threshold baseline (equation 11).')
     parser.add_argument('--gamma', type=float, default=0.6, help='CCAR importance adjustment (equation 11).')
     parser.add_argument('--alpha', type=float, default=0.4, help='CCAR geometric adjustment (equation 11).')
@@ -53,8 +68,6 @@ def parse_args():
                         help='Enable batch-local CCAR relabeling starting at this epoch.')
     parser.add_argument('--margin_1', type=float, default=0.5,
                         help='AUEM regularization offset delta.')
-    parser.add_argument('--margin_2', type=float, default=0.2,
-                        help='Legacy relabeling margin; unused by the active objective.')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size.')
     parser.add_argument('--optimizer', choices=('adam', 'sgd'), default='adam',
                         help='Optimizer.')
@@ -83,7 +96,144 @@ def parse_args():
                         help='Epoch-wise EMA decay for validation/checkpoint weights; 0 disables EMA.')
     parser.add_argument('--out_dimension', type=int, default=64, help='feature dimension')
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def implementation_version():
+    return (Path(__file__).resolve().parents[1] / 'VERSION').read_text(
+        encoding='utf-8').strip()
+
+
+def method_contract(args):
+    return {
+        'importance_source': IMPORTANCE_SOURCE,
+        'embedding_dim': args.out_dimension,
+        'uncertainty_representation': UNCERTAINTY_REPRESENTATION,
+        'backbone': 'resnet18',
+    }
+
+
+def resume_config(config):
+    """Return behavior-defining CLI values that must remain fixed on resume."""
+    values = vars(config) if not isinstance(config, dict) else config
+    return {
+        name: value for name, value in sorted(values.items())
+        if name not in RESUME_MUTABLE_FIELDS
+    }
+
+
+def required_resume_keys(args):
+    keys = list(BASE_RESUME_KEYS)
+    if args.ema_decay > 0.0:
+        keys.extend(('resume_model_state_dict', 'resume_fc_state_dict'))
+    return tuple(keys)
+
+
+def validate_resume_checkpoint(checkpoint, args):
+    if not isinstance(checkpoint, dict):
+        raise ValueError('Resume checkpoint must be a dictionary.')
+    version = checkpoint.get('checkpoint_format_version')
+    if version != CHECKPOINT_FORMAT_VERSION:
+        raise ValueError(
+            'This is not a V2 checkpoint and cannot be resumed. V2 changes '
+            'the AUEM importance input and restores vector uncertainty; use '
+            '--pretrained for a shape-compatible warm start instead.')
+
+    expected = method_contract(args)
+    observed = checkpoint.get('method_contract')
+    if observed != expected:
+        raise ValueError(
+            'Checkpoint method contract mismatch: expected {}, got {}'.format(
+                expected, observed))
+
+    saved_config = checkpoint.get('config')
+    if not isinstance(saved_config, dict):
+        raise ValueError('Resume checkpoint is missing its resolved CLI config.')
+    expected_config = resume_config(args)
+    observed_config = resume_config(saved_config)
+    if observed_config != expected_config:
+        changed = {
+            name: {
+                'checkpoint': observed_config.get(name, '<missing>'),
+                'current': expected_config.get(name, '<missing>'),
+            }
+            for name in sorted(set(observed_config) | set(expected_config))
+            if observed_config.get(name, '<missing>')
+            != expected_config.get(name, '<missing>')
+        }
+        raise ValueError(
+            'Resume configuration mismatch for behavior-defining values: {}'.format(
+                changed))
+
+    missing_keys = [
+        key for key in required_resume_keys(args) if key not in checkpoint
+    ]
+    if missing_keys:
+        raise ValueError(
+            'Resume checkpoint is missing required keys: {}'.format(missing_keys))
+    if checkpoint['ema_decay'] != args.ema_decay:
+        raise ValueError(
+            'Checkpoint EMA decay mismatch: expected {}, got {}'.format(
+                args.ema_decay, checkpoint['ema_decay']))
+
+
+def checkpoint_state_dict(checkpoint):
+    if not isinstance(checkpoint, dict):
+        raise ValueError('Pretrained checkpoint must contain a state dictionary.')
+    for container_key in ('state_dict', 'model_state_dict'):
+        candidate = checkpoint.get(container_key)
+        if isinstance(candidate, dict):
+            return candidate
+    if checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
+        return checkpoint
+    raise ValueError(
+        'Pretrained checkpoint must be a raw state dict or contain state_dict/model_state_dict.')
+
+
+def load_shape_compatible_state(model, source_state):
+    """Warm-start only exact name/shape matches and report every skipped key."""
+    target_state = model.state_dict()
+    compatible = {}
+    skipped = {}
+
+    for source_key, value in source_state.items():
+        candidates = [source_key]
+        if source_key.startswith('module.'):
+            candidates.append(source_key[len('module.'):])
+        else:
+            candidates.append('module.' + source_key)
+        target_key = next((key for key in candidates if key in target_state), None)
+
+        if target_key is None:
+            skipped[source_key] = 'missing target key'
+            continue
+        unwrapped_key = target_key.removeprefix('module.')
+        excluded_prefix = next(
+            (prefix for prefix in WARM_START_EXCLUDED_PREFIXES
+             if unwrapped_key.startswith(prefix)), None)
+        if excluded_prefix is not None:
+            skipped[source_key] = (
+                '{} tensors are not warm-start targets'.format(
+                    excluded_prefix.rstrip('.')))
+            continue
+        if not torch.is_tensor(value):
+            skipped[source_key] = 'value is not a tensor'
+            continue
+        if target_state[target_key].shape != value.shape:
+            skipped[source_key] = 'shape {} does not match {}'.format(
+                tuple(value.shape), tuple(target_state[target_key].shape))
+            continue
+        compatible[target_key] = value
+
+    if not compatible:
+        raise ValueError('No shape-compatible pretrained tensors were found.')
+    incompatible = model.load_state_dict(compatible, strict=False)
+    return {
+        'loaded': sorted(compatible),
+        'skipped': skipped,
+        'missing_after_load': sorted(incompatible.missing_keys),
+        'unexpected_after_load': sorted(incompatible.unexpected_keys),
+    }
 
 
 def setup_seed(seed):
@@ -96,6 +246,15 @@ def setup_seed(seed):
 
 def clone_state_dict_to_cpu(state_dict):
     return {name: tensor.detach().cpu().clone() for name, tensor in state_dict.items()}
+
+
+def restore_ema_states(checkpoint, ema_decay):
+    if checkpoint is None or ema_decay <= 0.0:
+        return None, None
+    return (
+        clone_state_dict_to_cpu(checkpoint['model_state_dict']),
+        clone_state_dict_to_cpu(checkpoint['fc_state_dict']),
+    )
 
 
 def update_ema_state(ema_state, current_state, decay):
@@ -198,6 +357,49 @@ class RafDataSet(data.Dataset):
         return image, label, idx
 
 
+class MinimumSizeBatchSampler(data.Sampler):
+    """Merge a too-small tail into the preceding batch without dropping data."""
+    def __init__(self, sampler, batch_size, minimum_batch_size):
+        if batch_size < minimum_batch_size:
+            raise ValueError(
+                'batch_size must be at least {}'.format(minimum_batch_size))
+        if len(sampler) < minimum_batch_size:
+            raise ValueError(
+                'training set must contain at least {} samples'.format(
+                    minimum_batch_size))
+        self.sampler = sampler
+        self.batch_size = batch_size
+        self.minimum_batch_size = minimum_batch_size
+
+    def __iter__(self):
+        pending = None
+        current = []
+        for index in self.sampler:
+            current.append(index)
+            if len(current) == self.batch_size:
+                if pending is not None:
+                    yield pending
+                pending = current
+                current = []
+
+        if pending is None:
+            yield current
+        elif current and len(current) < self.minimum_batch_size:
+            yield pending + current
+        else:
+            yield pending
+            if current:
+                yield current
+
+    def __len__(self):
+        full_batches, remainder = divmod(len(self.sampler), self.batch_size)
+        if full_batches == 0:
+            return 1
+        if remainder == 0 or remainder < self.minimum_batch_size:
+            return full_batches
+        return full_batches + 1
+
+
 def initialize_weight_goog(m, n=''):
     if isinstance(m, nn.Conv2d):
         fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
@@ -222,17 +424,29 @@ def run_training():
     args = parse_args()
     if not 0.0 <= args.ema_decay < 1.0:
         raise ValueError('--ema_decay must be in [0, 1).')
+    if args.checkpoint and args.pretrained:
+        raise ValueError('--checkpoint and --pretrained cannot be used together.')
     print(args)
+    resume_checkpoint = None
+    if args.checkpoint:
+        resume_checkpoint = torch.load(
+            args.checkpoint, map_location='cpu', weights_only=False)
+        validate_resume_checkpoint(resume_checkpoint, args)
+
     default_save_folder = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'runs', 'rafdb_noise0.1')
     save_folder = args.save_dir if args.save_dir else default_save_folder
     os.makedirs(save_folder, exist_ok=True)
 
     imagenet_pretrained = False
-    if args.backbone == "resnet18":
-        res18 = resnet18(pretrained=imagenet_pretrained, drop_rate=args.drop_rate, args=args)
-    elif args.backbone == "iresnet18":
-        res18 = iresnet18(pretrained=imagenet_pretrained, drop_rate=args.drop_rate, args=args)
+    cuda_device_count = torch.cuda.device_count()
+    if cuda_device_count < 1:
+        raise RuntimeError('The training entrypoint requires at least one CUDA device.')
+    minimum_training_batch_size = 2 * cuda_device_count
+
+    res18 = resnet18(
+        pretrained=imagenet_pretrained, drop_rate=args.drop_rate, args=args,
+        out_dim=args.out_dimension)
     res18 = torch.nn.DataParallel(res18).cuda()
     fc = nn.Linear(args.out_dimension, 7).cuda()
 
@@ -242,44 +456,14 @@ def run_training():
 
     if args.pretrained:
         print("Loading pretrained weights...", args.pretrained)
-        if args.backbone == "resnet18":
-            pretrained = torch.load(args.pretrained)
-            pretrained_state_dict = pretrained['state_dict']
-            model_state_dict = res18.state_dict()
-            loaded_keys = 0
-            total_keys = 0
-
-            print(len(pretrained_state_dict.keys()))
-            for key in pretrained_state_dict:
-                # print(key)
-                if ((key == 'module.fc.weight') | (key == 'module.fc.bias')):
-                    pass
-                else:
-                    model_state_dict[key] = pretrained_state_dict[key]
-                    total_keys += 1
-                    if key in model_state_dict:
-                        loaded_keys += 1
-            print("Loaded params num:", loaded_keys)
-            print("Total params num:", total_keys)
-            res18.load_state_dict(model_state_dict, strict=False)
-        elif args.backbone == "iresnet18":
-            checkpoint = torch.load(args.pretrained)
-            try:
-                pretrained_state_dict = checkpoint['state_dict']
-            except:
-                pretrained_state_dict = checkpoint
-            model_state_dict = res18.state_dict()
-            # pdb.set_trace()
-            # print(pretrained_state_dict.keys(),model_state_dict.keys())
-            for key in pretrained_state_dict:
-                if ((key == 'fc.weight') | (key == 'fc.bias')):
-                    pass
-                else:
-                    # print("module."+key)
-                    model_state_dict["module." + key] = pretrained_state_dict[key]
-            res18.load_state_dict(model_state_dict, strict=False)
-        else:
-            print("No backbone is found.")
+        pretrained = torch.load(
+            args.pretrained, map_location='cpu', weights_only=False)
+        warm_start_report = load_shape_compatible_state(
+            res18, checkpoint_state_dict(pretrained))
+        print('Warm-start loaded tensors:', len(warm_start_report['loaded']))
+        print('Warm-start skipped tensors:', len(warm_start_report['skipped']))
+        for key, reason in sorted(warm_start_report['skipped'].items()):
+            print('  skipped {}: {}'.format(key, reason))
 
     data_transforms = transforms.Compose([
         transforms.ToPILImage(),
@@ -325,16 +509,15 @@ def run_training():
             generator=torch.Generator().manual_seed(0))
         print('Inverse-sqrt sampler class counts:', class_counts.astype(int).tolist())
     else:
-        train_sampler = None
+        train_sampler = torch.utils.data.RandomSampler(train_dataset)
 
+    train_batch_sampler = MinimumSizeBatchSampler(
+        train_sampler, args.batch_size, minimum_training_batch_size)
     train_loader = torch.utils.data.DataLoader(train_dataset,
-                                               batch_size=args.batch_size,
                                                num_workers=args.workers,
-                                               sampler=train_sampler,
-                                               shuffle=train_sampler is None,
+                                               batch_sampler=train_batch_sampler,
                                                pin_memory=True,
-                                               persistent_workers=args.workers > 0,
-                                               drop_last=False
+                                               persistent_workers=args.workers > 0
                                                )
 
     data_transforms_val = transforms.Compose([
@@ -397,41 +580,26 @@ def run_training():
     # 交叉熵损失函数Lwce
     criterion = torch.nn.CrossEntropyLoss()
 
-    margin_1 = args.margin_1
-    margin_2 = args.margin_2
-    beta = args.beta
     best_acc = -1.0
     best_epoch = 0
     checkpoint_path = os.path.join(save_folder, 'best.pth')
     start_epoch = 1
-    if args.checkpoint:
-        resume_checkpoint = torch.load(
-            args.checkpoint, map_location='cpu', weights_only=False)
-        required_keys = (
-            'iter', 'best_val_accuracy', 'model_state_dict', 'fc_state_dict',
-            'ccar_state_dict', 'optimizer_state_dict')
-        missing_keys = [key for key in required_keys if key not in resume_checkpoint]
-        if missing_keys:
-            raise ValueError('Resume checkpoint is missing required keys: {}'.format(missing_keys))
+    ema_res18_state, ema_fc_state = restore_ema_states(
+        resume_checkpoint, args.ema_decay)
+    if resume_checkpoint is not None:
         res18.load_state_dict(resume_checkpoint.get(
             'resume_model_state_dict', resume_checkpoint['model_state_dict']))
         fc.load_state_dict(resume_checkpoint.get(
             'resume_fc_state_dict', resume_checkpoint['fc_state_dict']))
         ccar.load_state_dict(resume_checkpoint['ccar_state_dict'])
         optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
-        if 'scheduler_state_dict' in resume_checkpoint:
-            scheduler.load_state_dict(resume_checkpoint['scheduler_state_dict'])
-        elif args.lr_scheduler == 'plateau':
-            print('Warning: resume checkpoint has no scheduler state; plateau history starts fresh.')
+        scheduler.load_state_dict(resume_checkpoint['scheduler_state_dict'])
         start_epoch = int(resume_checkpoint['iter']) + 1
         best_epoch = int(resume_checkpoint['iter'])
         best_acc = float(resume_checkpoint['best_val_accuracy'])
         torch.save(resume_checkpoint, checkpoint_path)
         print('Resumed from epoch {}. Continuing at epoch {} from {}.'.format(
             best_epoch, start_epoch, args.checkpoint))
-
-    ema_res18_state = None
-    ema_fc_state = None
 
     def evaluate(loader):
         res18.eval()
@@ -459,108 +627,33 @@ def run_training():
         train_sample_count = 0
         res18.train()
         fc.train()
-        for batch_i, (imgs, targets, indexes) in enumerate(train_loader):
+        for batch_i, (imgs, targets, _) in enumerate(train_loader):
             batch_sz = imgs.size(0)
             train_sample_count += batch_sz
             iter_cnt += 1
             optimizer.zero_grad()
 
             imgs = imgs.cuda()
-            targets=targets.cuda()
-            indexes = indexes.cuda()
-            # ---------------- 前向传播与不确定性计算 ----------------#
-            # 获取特征均值和方差的对数值
-            # mu, uncertainties = res18(imgs, phase='train')  # 获取均值和log方差
-            # # print(uncertainties.shape)
-            # tops = int(batch_sz * 20 / 128)
-            # high_mask, high_idx = torch.topk(uncertainties.squeeze(), tops)
-            # down_value, low_idx = torch.topk(uncertainties.squeeze(), batch_sz - tops, largest=False)
-            # tops_2 = int(down_value.shape[0] * 88 / 108)
-            # middle_mask, middle_idx = torch.topk(down_value, tops_2)
-            # low_mask, low_idx = torch.topk(down_value, batch_sz - tops - tops_2, largest=False)
-            # high_idx = high_idx.to(torch.long)
-            # low_idx = low_idx.to(torch.long)
-            # middle_mean = torch.mean(middle_mask)
-            # outputs = fc(mu)  # 所有样本初始预测结果
+            targets = targets.cuda()
             mu, uncertainties, importance = res18(imgs, phase='train', return_importance=True)
             importance = importance.squeeze(1)
-            uncertainty = uncertainties.squeeze(1)
-            tops = batch_sz // 2
-            # AUEM uses importance to define the two uncertainty regions.
-            sorted_idx = torch.argsort(importance)
-            low_importance_idx = sorted_idx[:tops]
-            high_importance_idx = sorted_idx[tops:].flip(0)
-            high_mask = uncertainty[low_importance_idx]
-            low_mask = uncertainty[high_importance_idx]
-            high_importance = importance[high_importance_idx].mean()
-            low_importance = importance[low_importance_idx].mean()
-            # The paper's i_{l+delta} is interpreted as i_l + delta.
-            auem_loss = torch.log((low_importance + margin_1) / high_importance.clamp_min(1e-6))
-            total_mask = torch.cat([high_mask, low_mask])  # 直接拼接张量
-            total_mean = torch.mean(total_mask)
-            total_idx = torch.cat([low_importance_idx, high_importance_idx])
-            outputs = fc(mu)  # 所有样本初始预测结果
+            high_uncertainty_idx, low_uncertainty_idx = split_uncertainty_regions(
+                importance)
+            auem_loss = auem_regularization_loss(
+                importance, high_uncertainty_idx, low_uncertainty_idx,
+                delta=args.margin_1)
 
-            # ---------------- 样本混合策略 ----------------#
-            total_loss = 0.0  # 总损失初始化
-            pair_num = min(low_importance_idx.numel(), high_importance_idx.numel())
-            if pair_num > 0:
-                high_pair_idx = low_importance_idx[
-                    torch.randperm(low_importance_idx.numel(), device=imgs.device)[:pair_num]]
-                low_pair_idx = high_importance_idx[
-                    torch.randperm(high_importance_idx.numel(), device=imgs.device)[:pair_num]]
-                different_labels = targets[high_pair_idx] != targets[low_pair_idx]
-                high_pair_idx = high_pair_idx[different_labels]
-                low_pair_idx = low_pair_idx[different_labels]
+            outputs = fc(mu)
+            dsruc_loss_value, _ = dsruc_loss(
+                mu, uncertainties, targets, fc,
+                high_uncertainty_idx, low_uncertainty_idx)
+            ccar_targets = ccar_batch_targets(
+                ccar, mu, targets, importance, outputs,
+                relabel_enabled=i >= args.relabel_epoch)
 
-            if pair_num > 0 and high_pair_idx.numel() > 0:
-                mu_high = mu[high_pair_idx]
-                mu_low = mu[low_pair_idx]
-
-                high_pair_uncertainty = uncertainty[high_pair_idx]
-                low_pair_uncertainty = uncertainty[low_pair_idx]
-                weight_high = high_pair_uncertainty / (high_pair_uncertainty + low_pair_uncertainty + 1e-8)
-                weight_low = 1 - weight_high
-
-                # 特征线性组合
-                mixed_feat = weight_high.unsqueeze(1) * mu_high + weight_low.unsqueeze(1) * mu_low
-                outputs_mixed = fc(mixed_feat)
-
-                # 计算混合样本损失
-                targets_high = targets[high_pair_idx]
-                targets_low = targets[low_pair_idx]
-                loss_high = F.cross_entropy(outputs_mixed, targets_high)
-                loss_low = F.cross_entropy(outputs_mixed, targets_low)
-
-                # # 权重正则项（鼓励权重分布平衡）
-                # reg_term = 0.5 * (weight_high.log().mean() + weight_low.log().mean())
-
-                total_loss += (loss_high + loss_low)
-
-            # targets2=targets[important_indices].cuda()
-            targets = targets.cuda()
-
-            # CCAR geometry and P_gt use the original dataset labels. The
-            # corrected labels are local targets for this batch's L_CCAR only.
-            ccar.update(mu, targets)
-            ccar_targets = targets
-            if i >= args.relabel_epoch:
-                relabel_mask, predicted_labels = ccar.propose(
-                    mu, targets, importance, outputs)
-                if relabel_mask.any():
-                    ccar_targets = targets.clone()
-                    ccar_targets[relabel_mask] = predicted_labels[relabel_mask]
-
-            # sorted_idx = torch.argsort(uncertainties.squeeze(), descending=True)
-            # top80_percent_idx = sorted_idx[:int(len(sorted_idx) * 237 / 239)]
-            # loss = criterion(outputs[top80_percent_idx], targets[top80_percent_idx]) + RR_loss1 + RR_loss2
-            # Previous weighted CE is retained for comparison with equation (13).
-            # sample_losses = F.cross_entropy(outputs, targets, reduction='none')
-            # weighted_ce = (importance * sample_losses).sum() / importance.sum().clamp_min(1e-6)
-            # loss = weighted_ce + auem_loss + total_loss
-            loss = ccar_loss(outputs, ccar_targets, importance) + auem_loss + total_loss
-
-            # loss = criterion(outputs, targets)+RR_loss1+RR_loss2
+            # Equations (13)-(14): scaled-logit CCAR plus AUEM and DSRUC.
+            loss = (ccar_loss(outputs, ccar_targets, importance)
+                    + auem_loss + dsruc_loss_value)
 
             loss.backward()
             optimizer.step()
@@ -569,36 +662,6 @@ def run_training():
             _, predicts = torch.max(outputs, 1)
             correct_num = torch.eq(predicts, targets).sum()
             correct_sum += correct_num.item()
-
-            # Legacy CCAR block, disabled and retained for rollback:
-            # # 第三个模块，重标记模块
-            # # Relabel samples
-            # # args.relabel_epoch
-            # if i >= args.relabel_epoch:
-            #     Uw2 = torch.max(total_mask)
-            #     Lw2 = torch.min(total_mask)
-            #     Wi2 = uncertainties
-            #     We2 = total_mean
-            #     # threshold2 = 0.15 + ((Uw2-Lw2)/(Wi2-We2))
-            #     threshold2 = 1 + 0.15 * ((Wi2 - total_mean) / (Uw2 - Lw2))
-            #
-            #     sm2 = torch.softmax(outputs, dim=1)
-            #     Pmax2, predicted_labels2 = torch.max(sm2, 1)  # predictions
-            #     Pgt2 = torch.gather(sm2, 1,
-            #                         targets.view(-1, 1)).squeeze()  # retrieve predicted probabilities of targets
-            #     true_or_false2 = Pmax2 - Pgt2 > 0.05 #/ threshold2
-            #     update_idx2 = true_or_false2.nonzero().squeeze()  # get samples' index in this mini-batch where (Pmax - Pgt > margin_2)
-            #     new_update_idx2 = torch.from_numpy(np.intersect1d(total_idx.cpu().numpy(), update_idx2.cpu().numpy()))
-            #     label_idx2 = indexes[new_update_idx2]  # get samples' index in train_loader
-            #     relabels2 = predicted_labels2[new_update_idx2]  # predictions where (Pmax - Pgt > margin_2)
-            #
-            #     train_loader.dataset.label[
-            #         label_idx2.cpu().numpy()] = relabels2.cpu().numpy()  # relabel samples in train_loader
-
-            # Previous permanent dataset-label writeback is disabled. Equation
-            # (8) refers to the label supplied by the original training data.
-            # train_loader.dataset.label[indexes[relabel_mask].cpu().numpy()] = (
-            #     predicted_labels[relabel_mask].cpu().numpy())
 
         acc = correct_sum / float(train_sample_count)
         running_loss = running_loss / iter_cnt
@@ -642,6 +705,10 @@ def run_training():
             best_acc = val_acc
             best_epoch = i
             checkpoint_payload = {
+                'checkpoint_format_version': CHECKPOINT_FORMAT_VERSION,
+                'implementation_version': implementation_version(),
+                'method_contract': method_contract(args),
+                'config': vars(args).copy(),
                 'iter': i,
                 'best_val_accuracy': best_acc,
                 'model_state_dict': val_model_state,

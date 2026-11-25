@@ -215,7 +215,8 @@ class ResNet(nn.Module):
 
         self.fc = nn.Linear(512 * block.expansion, num_classes) # new fc layer 512x7
         # print("fc_in_dim",fc_in_dim)
-        self.alpha = nn.Sequential(nn.Linear(512 * block.expansion, 1),nn.Sigmoid())
+        # Equation (1): importance is computed from the embedding mu_j.
+        self.alpha = nn.Sequential(nn.Linear(self.out_dim, 1), nn.Sigmoid())
 
         # 修改mu和log_var结构，添加自适应池化
         class Flatten(nn.Module):
@@ -235,8 +236,8 @@ class ResNet(nn.Module):
             nn.Dropout(p=self.drop_rate),
             nn.AdaptiveAvgPool2d((7, 7)),  # 新增自适应池化
             Flatten(),
-            nn.Linear(512 * 7 * 7, 1),
-            nn.BatchNorm1d(1, eps=2e-5),
+            nn.Linear(512 * 7 * 7, self.out_dim),
+            nn.BatchNorm1d(self.out_dim, eps=2e-5),
             nn.Sigmoid()
         )
         # 修改后的初始化逻辑
@@ -311,6 +312,17 @@ class ResNet(nn.Module):
         else:
             return self.fc(x)
 
+    def compute_importance(self, mu: Tensor) -> Tensor:
+        """Compute Equation (1) from a per-sample normalized embedding."""
+        if mu.ndim != 2 or mu.size(1) != self.out_dim:
+            raise ValueError(
+                'Expected mu with shape [batch, {}], got {}'.format(
+                    self.out_dim, tuple(mu.shape)))
+        feature_min = mu.amin(dim=1, keepdim=True)
+        feature_range = (mu.amax(dim=1, keepdim=True) - feature_min).clamp_min(1e-6)
+        normalized_mu = (mu - feature_min) / feature_range
+        return self.alpha(normalized_mu)
+
     def forward(self, x: Tensor, phase='train', return_importance=False):
         # 标准特征提取流程
         x = self.conv1(x)
@@ -328,11 +340,7 @@ class ResNet(nn.Module):
             mu = self.mu(x)
             uncertainty = self.log_var(x)
             if return_importance:
-                features = self.avgpool(x).flatten(1)
-                feature_min = features.amin(dim=1, keepdim=True)
-                feature_range = (features.amax(dim=1, keepdim=True) - feature_min).clamp_min(1e-6)
-                normalized_features = (features - feature_min) / feature_range
-                importance = self.alpha(normalized_features)
+                importance = self.compute_importance(mu)
                 return mu, uncertainty, importance
             return mu, uncertainty
         else:

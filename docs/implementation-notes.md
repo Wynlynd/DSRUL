@@ -4,6 +4,9 @@ This document records the active behavior of the public RAF-DB path. It
 separates implementation choices from claims that are explicit in the
 manuscript.
 
+V2 was aligned against the 14-page manuscript PDF with SHA-256
+`DA235CB8344C22411137C4C84CFDBBB7238827122A72E6FB648C63D952D30184`.
+
 ## Active dataflow
 
 The primary path is:
@@ -12,7 +15,7 @@ The primary path is:
 image
   -> ResNet-18 trunk
   -> 64-D embedding (mu) -------------> external 7-class classifier
-  -> scalar uncertainty --------------> DSRUC mixture weights
+  -> 64-D uncertainty vector ----------> DSRUC mixture weights
   -> scalar sample importance --------> AUEM split/regularizer and CCAR
 ```
 
@@ -21,13 +24,18 @@ the saved checkpoint.
 
 ## AUEM
 
-The importance head is a `Linear(512, 1) + Sigmoid` module. It receives the
-per-sample min-max normalized global-pooled backbone feature, not the final
-64-D `mu` embedding.
+The importance head is a `Linear(out_dimension, 1) + Sigmoid` module. Following
+Equation (1), it receives the per-sample min-max-normalized `mu` embedding. The
+default `out_dimension` is 64, and the same value configures the embedding,
+importance head, external classifier, CCAR prototypes, and checkpoint contract.
 
 Within each mini-batch, samples are sorted by importance. The lower half is
 treated as the high-uncertainty region and the upper half as the low-uncertainty
-region. For odd batch sizes, one region contains one additional sample.
+region. For an odd batch size, the high-uncertainty region has `floor(B/2)`
+samples and the low-uncertainty region has `ceil(B/2)`; pairing then uses the
+smaller count. Because both learned branches contain `BatchNorm1d`, the training
+batch sampler guarantees at least two samples per visible CUDA device. It
+merges an unsafe final tail into the preceding batch instead of dropping data.
 
 The active AUEM regularizer is:
 
@@ -37,8 +45,10 @@ L_AUEM = log((mean(low-importance) + delta) / mean(high-importance))
 
 with `delta = 0.5` by default. The denominator has a small numerical clamp.
 
-An earlier ordinary sample-weighted cross-entropy implementation remains only
-as disabled source comments. It is not part of the active objective.
+The manuscript also mentions a weighted cross-entropy in prose but gives no
+formula or fourth term in Equation (14). V2 therefore does not invent an extra
+classification loss; the importance-dependent classification behavior remains
+the scaled-logit CCAR loss in Equation (13).
 
 ## DSRUC
 
@@ -46,12 +56,17 @@ The two importance-defined groups are independently shuffled and truncated to
 the same pair count. Same-label pairs are removed. If no different-label pair
 remains, the batch has no DSRUC loss.
 
-For a retained high/low pair, the independent uncertainty outputs define
-complementary mixture weights:
+For a retained high/low pair, the independent uncertainty vectors are first
+normalized component-wise as required by Equation (4). The normalized vectors
+are then averaged across their feature dimension to produce the scalar mixture
+weights in Equation (5):
 
 ```text
-w_high = u_high / (u_high + u_low + epsilon)
-w_low  = 1 - w_high
+denominator[k] = max(u_high[k] + u_low[k], epsilon)
+normalized_high[k] = u_high[k] / denominator[k]
+normalized_low[k]  = u_low[k] / denominator[k]
+w_high = mean(normalized_high)
+w_low  = mean(normalized_low)
 mixed  = w_high * mu_high + w_low * mu_low
 ```
 
@@ -116,5 +131,14 @@ training images. The official test split is evaluated only after the best
 validation checkpoint is reloaded, unless `--skip_test_eval` is specified.
 
 The split image names and split parameters are saved in `split_manifest.json`.
-The repository does not currently save RNG/sampler state, a full resolved CLI
-configuration, metric history, or prediction files.
+V2 checkpoints save the resolved CLI configuration, checkpoint format version,
+implementation version, and method contract. V1 full checkpoints cannot resume
+V2 because the importance and uncertainty head topologies changed. The method
+contract records `pairwise_normalized_vector_mean` as the uncertainty
+representation. Resume requires scheduler state, restores EMA history when
+enabled, and rejects changes to behavior-defining CLI values. Output controls
+and the early-stop target may change, but the total epoch plan remains fixed
+because it defines the cosine scheduler horizon. `--pretrained` instead loads
+only exact name/shape matches while excluding the classifier, importance, and
+uncertainty heads, and reports all skipped tensors. The repository does not
+currently save RNG/sampler state, metric history, or prediction files.
