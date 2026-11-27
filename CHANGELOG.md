@@ -3,7 +3,56 @@
 All notable changes are documented here. Version branches are preserved rather
 than overwritten so each research-code state remains auditable.
 
-## [Unreleased]
+## [2.0.0-experiment.c-preupdate-proposal] - 2026-11-27
+
+Branch: `experiment-c-preupdate-proposal`
+Baseline: `version-2-paper-alignment@dd772ae`
+
+### Changed
+
+- Changed the CCAR order after relabeling is enabled from
+  `update -> propose` to `propose -> update`. The proposal therefore uses the
+  prototypes saved after previous batches and the current sample cannot move
+  its own prototype before being judged.
+- Preserved the baseline behavior before `relabel_epoch`: prototypes update and
+  the original observed labels remain the batch targets.
+- Added the CCAR update order to the checkpoint method contract.
+
+### Added
+
+- Added ordering tests for both sides of `relabel_epoch` and a numerical
+  regression case that distinguishes pre-update from post-update prototype
+  decisions.
+- Added the implementation version and method contract to the training startup
+  log so uploaded server runs identify the active experiment unambiguously.
+- Added a server-use guide with the controlled Experiment C command.
+
+### Compatibility
+
+- Checkpoint tensor shapes are unchanged, but V2 baseline full checkpoints are
+  intentionally rejected for resume because their method contract lacks the
+  Experiment C update order. Shape-compatible weights can still be loaded with
+  `--pretrained`.
+
+### Validation
+
+- Verified with Python 3.13.11 and PyTorch 2.9.1+cu128 from the project's
+  `pytorch_env` environment.
+- `python -m compileall -q src` passed.
+- `python -m unittest discover -s src -p "test_*.py" -v` passed all 19 tests.
+- `python src/train_rafdb.py --help`, the implementation-version assertion, and
+  `git diff --check` passed.
+- Full RAF-DB training is pending.
+
+### Known limitations
+
+- This experiment does not remove noisy-label samples from prototype updates.
+- The changed operation order is a diagnostic intervention rather than a claim
+  about the manuscript's original Equation (7)-(12) execution order.
+- Full training and repeated-seed comparisons against the V2 baseline remain
+  pending.
+
+## [2.0.0-dev]
 
 Target version: `2.0.0`
 Branch: `version-2-paper-alignment`

@@ -1,11 +1,21 @@
-# DSRUL implementation notes
+# DSRUL Experiment C implementation notes
 
 This document records the active behavior of the public RAF-DB path. It
 separates implementation choices from claims that are explicit in the
 manuscript.
 
-V2 was aligned against the 14-page manuscript PDF with SHA-256
+Experiment C is based on V2 commit
+`dd772aef62e3904fb77e3a05b6648ad0290b85a2`. V2 was aligned against the
+14-page manuscript PDF with SHA-256
 `DA235CB8344C22411137C4C84CFDBBB7238827122A72E6FB648C63D952D30184`.
+
+This branch intentionally changes the batch operation order after CCAR
+relabeling is enabled. It is a diagnostic experiment for self-inclusion bias,
+not a claim that the changed order is stated in the manuscript.
+
+The training entrypoint prints the implementation version and complete method
+contract before loading data. Server logs therefore retain the experiment
+identity even when the uploaded directory name is changed.
 
 ## Active dataflow
 
@@ -103,6 +113,20 @@ label. When `Pmax > Pgt + threshold`, the predicted class becomes the target
 for the current batch's CCAR loss. The dataset label is not permanently
 modified, and prototype updates continue to use original labels.
 
+Before `relabel_epoch`, each batch updates the prototypes and retains the
+original targets. Starting at `relabel_epoch`, the order is:
+
+```text
+1. Compute the proposal with the prototypes saved after previous batches.
+2. Update the prototypes with the current embeddings and original labels.
+3. Use the proposal as the current batch's L_CCAR target where its mask is true.
+```
+
+Consequently, a sample does not move its own class prototype before its
+geometric inconsistency is measured. If the required prototypes are not yet
+initialized, the existing validity mask prevents relabeling and the update
+still occurs. The prototypes are delayed by one batch, not by one epoch.
+
 The active CCAR classification term is:
 
 ```text
@@ -131,14 +155,11 @@ training images. The official test split is evaluated only after the best
 validation checkpoint is reloaded, unless `--skip_test_eval` is specified.
 
 The split image names and split parameters are saved in `split_manifest.json`.
-V2 checkpoints save the resolved CLI configuration, checkpoint format version,
-implementation version, and method contract. V1 full checkpoints cannot resume
-V2 because the importance and uncertainty head topologies changed. The method
-contract records `pairwise_normalized_vector_mean` as the uncertainty
-representation. Resume requires scheduler state, restores EMA history when
-enabled, and rejects changes to behavior-defining CLI values. Output controls
-and the early-stop target may change, but the total epoch plan remains fixed
-because it defines the cosine scheduler horizon. `--pretrained` instead loads
-only exact name/shape matches while excluding the classifier, importance, and
-uncertainty heads, and reports all skipped tensors. The repository does not
-currently save RNG/sampler state, metric history, or prediction files.
+Experiment C checkpoints save the resolved CLI configuration, checkpoint format
+version, implementation version, and method contract. The contract records the
+`propose_then_update_when_relabeling` CCAR order, so a V2 baseline full
+checkpoint is rejected for resume instead of silently changing methods.
+`--pretrained` remains available for the restricted shape-compatible warm start.
+Resume requires scheduler state, restores EMA history when enabled, and rejects
+changes to behavior-defining CLI values. The repository does not currently save
+RNG/sampler state, metric history, or prediction files.

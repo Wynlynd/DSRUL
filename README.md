@@ -3,21 +3,44 @@
 Reference implementation of **DSRUL: A Novel Adaptive Dual-Stream Relative
 Uncertainty Learning Method for Facial Expression Recognition**.
 
-> **Version:** `2.0.0-dev` (Version 2 development)
+> **Version:** `2.0.0-experiment.c-preupdate-proposal` (Experiment C)
 >
-> **Branch:** `version-2-paper-alignment`
+> **Branch:** `experiment-c-preupdate-proposal`
 >
-> **Stable baseline:** [`main@0d5f3a2`](https://github.com/Wynlynd/DSRUL/tree/0d5f3a2d11d151d90ebb40f9462cead7a292b350)
+> **Experiment baseline:** [`version-2-paper-alignment@dd772ae`](https://github.com/Wynlynd/DSRUL/tree/dd772aef62e3904fb77e3a05b6648ad0290b85a2)
 >
 > **Changes:** [CHANGELOG.md](CHANGELOG.md)
 
-> **Status:** V2 aligns the AUEM importance path with Equation (1), adds
-> equation-level regression tests, and versions the checkpoint contract. This
-> snapshot contains the corrected RAF-DB training path
-> for AUEM, DSRUC, and CCAR. All 17 focused V2 tests, source compilation, and
-> CLI checks pass in the environment recorded in the changelog. Full-dataset
-> training and the numerical results reported in the manuscript have not yet
-> been reproduced from this repository snapshot.
+> **Status:** This diagnostic branch changes only the CCAR operation order once
+> relabeling is enabled: the current batch is judged with the prototypes from
+> previous batches, then the prototypes are updated. It is intended to measure
+> self-inclusion bias and is not presented as the manuscript's original
+> update-before-proposal implementation. Full RAF-DB training remains pending.
+
+## Experiment C
+
+The V2 baseline updates a prototype with the current batch before using that
+prototype to judge the same samples. Experiment C removes that self-inclusion:
+
+```text
+before --relabel_epoch: update prototypes; keep original batch targets
+from   --relabel_epoch: propose targets with pre-update prototypes; then update
+```
+
+The prototype update still uses every sample's original observed training
+label. Relabeling remains batch-local and affects only `L_CCAR`; dataset labels
+are not overwritten. All AUEM, DSRUC, optimizer, scheduler, augmentation, and
+evaluation behavior is unchanged from the experiment baseline.
+
+At startup, the training log prints the implementation version and method
+contract. A valid Experiment C run must report
+`2.0.0-experiment.c-preupdate-proposal` and
+`ccar_update_order: propose_then_update_when_relabeling`.
+
+If relabeling is enabled before enough prototypes exist, CCAR's existing
+validity mask keeps those samples unchanged and the batch then initializes or
+updates the prototypes normally. "Pre-update" therefore means one batch behind,
+not one epoch behind.
 
 ## Overview
 
@@ -195,9 +218,11 @@ python src/train_rafdb.py \
 V2 checkpoints restore the backbone, external classifier, CCAR state,
 optimizer, scheduler, epoch, and EMA history when enabled. They carry a format
 version and method contract (`normalized_mu`, embedding dimension,
-`pairwise_normalized_vector_mean`, and ResNet-18). V1 checkpoints cannot be
-resumed because the importance and uncertainty head shapes changed; use
-`--pretrained` for the restricted warm start described above. Resume rejects
+`pairwise_normalized_vector_mean`, ResNet-18, and the CCAR update order). V1
+checkpoints cannot be resumed because the importance and uncertainty head
+shapes changed. V2 baseline full checkpoints are also rejected because they do
+not declare the Experiment C update order. Use `--pretrained` for the restricted
+warm start described above. Resume rejects
 changes to behavior-defining data, method, optimizer, scheduler, augmentation,
 and EMA settings. Resume-location/output controls, the historical warm-start
 source field, early-stop target, and the final test-evaluation switch are
@@ -236,9 +261,10 @@ python -m unittest discover -s src -p "test_*.py" -v
 They cover the `mu -> normalization -> importance` path, the documented V2
 interpretations of Equations (2)-(6), vector-uncertainty normalization and
 reduction, three-term gradient reach, prototype initialization and EMA, dynamic
-thresholds, relabel ordering, scaled-logit loss behavior, warm-start filtering,
-and V2 checkpoint compatibility. These tests validate component behavior; they
-do not replace full-dataset training or result reproduction.
+thresholds, pre-update-prototype relabel ordering, scaled-logit loss behavior,
+warm-start filtering, and checkpoint compatibility. These tests validate
+component behavior; they do not replace full-dataset training or result
+reproduction.
 
 ## Reproducibility Boundary
 
@@ -249,6 +275,9 @@ do not replace full-dataset training or result reproduction.
   each term.
 - The current CCAR classification term scales each sample's logits by its
   importance before cross-entropy. It is not ordinary sample-weighted CE.
+- Experiment C changes only the relabel/update order. It does not filter noisy
+  samples from prototype updates and must not be described as a clean-prototype
+  method.
 - Full RAF-DB training, repeated-seed statistics, and the manuscript tables
   remain to be reproduced and released.
 
@@ -259,6 +288,7 @@ matching environment, dataset/noise protocol, checkpoint, seed, and run logs.
 
 | Version | Branch/baseline | Main change |
 | --- | --- | --- |
+| `2.0.0-experiment.c-preupdate-proposal` | `experiment-c-preupdate-proposal`, based on `dd772ae` | Uses pre-update prototypes to propose batch-local CCAR targets, then updates prototypes with the current batch. |
 | `2.0.0-dev` | `version-2-paper-alignment` | Computes AUEM importance from normalized `mu`, restores vector uncertainty for DSRUC, adds regression coverage for the documented V2 interpretations, and adds versioned checkpoints. No paper accuracy is claimed. |
 | V1 baseline | `main@0d5f3a2` | First public RAF-DB path with AUEM, DSRUC, CCAR, validation checkpointing, and explicit reproducibility limits. |
 

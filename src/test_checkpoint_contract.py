@@ -27,7 +27,7 @@ class CheckpointContractTests(unittest.TestCase):
     def checkpoint(args):
         checkpoint = {
             'checkpoint_format_version': CHECKPOINT_FORMAT_VERSION,
-            'implementation_version': '2.0.0-dev',
+            'implementation_version': '2.0.0-experiment.c-preupdate-proposal',
             'method_contract': method_contract(args),
             'config': vars(args).copy(),
             'iter': 3,
@@ -63,6 +63,12 @@ class CheckpointContractTests(unittest.TestCase):
         mismatched['method_contract']['uncertainty_representation'] = 'scalar'
         with self.assertRaisesRegex(ValueError, 'method contract mismatch'):
             validate_resume_checkpoint(mismatched, args)
+
+        baseline_contract = dict(checkpoint)
+        baseline_contract['method_contract'] = dict(checkpoint['method_contract'])
+        baseline_contract['method_contract'].pop('ccar_update_order')
+        with self.assertRaisesRegex(ValueError, 'method contract mismatch'):
+            validate_resume_checkpoint(baseline_contract, args)
 
     def test_resume_rejects_config_drift_and_incomplete_state(self):
         args = self.args()

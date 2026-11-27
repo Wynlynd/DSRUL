@@ -1,0 +1,97 @@
+DSRUL 实验 C 服务器使用说明
+
+实验身份
+========
+
+分支：experiment-c-preupdate-proposal
+版本：2.0.0-experiment.c-preupdate-proposal
+基线：version-2-paper-alignment@dd772aef62e3904fb77e3a05b6648ad0290b85a2
+
+本实验只改变 CCAR 在启用重标后的执行顺序：先用当前 batch 更新前的原型
+提出重标目标，再用当前 batch 的原始观测标签更新原型。relabel_epoch 之前
+仍然只更新原型，不执行重标。其他训练逻辑与 V2 基线保持一致。
+
+目录要求
+========
+
+RAF-DB 数据目录应包含：
+
+/新数据集/raf-basic/EmoLabel/list_patition_label.txt
+/新数据集/raf-basic/EmoLabel/0.1noise_train.txt
+/新数据集/raf-basic/Image/aligned/
+
+预训练权重：
+
+/新数据集/ijba_res18_naive.pth.tar
+
+运行前检查
+==========
+
+在上传后的代码根目录执行：
+
+/DSRUL_code/.venv/bin/python3 -m unittest discover -s src -p "test_*.py" -v
+/DSRUL_code/.venv/bin/python3 src/train_rafdb.py --help
+
+训练命令
+========
+
+请先把 save_dir 末尾时间改为本次实际启动时间，避免覆盖其他实验。
+
+/DSRUL_code/.venv/bin/python3 src/train_rafdb.py \
+  --raf_path /新数据集/raf-basic \
+  --train_label_file 0.1noise_train.txt \
+  --clean_label_file list_patition_label.txt \
+  --pretrained /新数据集/ijba_res18_naive.pth.tar \
+  --save_dir /result/rafdb_noise0.1_experiment_c_YYYYMMDD_HHMMSS \
+  --val_ratio 0.1 \
+  --split_seed 0 \
+  --target_val_accuracy 1.1 \
+  --batch_size 256 \
+  --workers 1 \
+  --epochs 100 \
+  --optimizer adam \
+  --lr 0.0002 \
+  --weight_decay 0.0001 \
+  --lr_scheduler exponential \
+  --lr_decay_gamma 0.99 \
+  --train_sampler shuffle \
+  --drop_rate 0.2 \
+  --rotation_degrees 0 \
+  --ema_decay 0 \
+  --beta 0.2 \
+  --gamma 0.6 \
+  --alpha 0.4 \
+  --prototype_momentum 0.9 \
+  --ccar_temperature 0.1 \
+  --relabel_epoch 8 \
+  --margin_1 0.5 \
+  --out_dimension 64
+
+启动身份核验
+============
+
+训练开始时必须看到以下两项；若版本或 ccar_update_order 不一致，请停止训练并
+重新检查上传目录：
+
+Implementation version: 2.0.0-experiment.c-preupdate-proposal
+Method contract: {... 'ccar_update_order': 'propose_then_update_when_relabeling'}
+
+输出文件
+========
+
+save_dir 中至少会生成：
+
+best.pth
+split_manifest.json
+
+训练完成后日志末尾会输出官方测试集 accuracy、loss、选中的 epoch 和最优
+验证 accuracy。请同时保留完整终端日志、代码版本和 save_dir。
+
+注意事项
+========
+
+1. 这是实验 C，不是 clean-prototype 版本；噪声标签样本仍会参与原型更新。
+2. 不要使用 V2 基线的 --checkpoint 直接恢复本实验。若只需加载兼容权重，
+   使用 --pretrained。
+3. 不要与实验 B 共用 save_dir。
+4. 为保证可比性，除 save_dir 外不要修改上述参数。

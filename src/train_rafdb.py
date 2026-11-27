@@ -110,6 +110,7 @@ def method_contract(args):
         'embedding_dim': args.out_dimension,
         'uncertainty_representation': UNCERTAINTY_REPRESENTATION,
         'backbone': 'resnet18',
+        'ccar_update_order': 'propose_then_update_when_relabeling',
     }
 
 
@@ -427,6 +428,8 @@ def run_training():
     if args.checkpoint and args.pretrained:
         raise ValueError('--checkpoint and --pretrained cannot be used together.')
     print(args)
+    print('Implementation version: {}'.format(implementation_version()))
+    print('Method contract: {}'.format(method_contract(args)))
     resume_checkpoint = None
     if args.checkpoint:
         resume_checkpoint = torch.load(

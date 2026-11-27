@@ -91,13 +91,14 @@ def dsruc_loss(embeddings, uncertainty, labels, classifier,
 
 def ccar_batch_targets(ccar, embeddings, original_labels, importance, logits,
                        relabel_enabled):
-    """Update Equation (7) before applying Equations (8)-(12)."""
-    ccar.update(embeddings, original_labels)
+    """Use the previous prototypes for relabeling, then update them."""
     if not relabel_enabled:
+        ccar.update(embeddings, original_labels)
         return original_labels
 
     relabel_mask, predicted_labels = ccar.propose(
         embeddings, original_labels, importance, logits)
+    ccar.update(embeddings, original_labels)
     if not relabel_mask.any():
         return original_labels
 

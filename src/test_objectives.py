@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ccar import ClusterContrastiveRelabeler
 from objectives import (
     auem_regularization_loss,
     build_dsruc_pairs,
@@ -71,7 +72,7 @@ class ObjectiveTests(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(embeddings.grad)
 
-    def test_ccar_updates_with_original_labels_before_proposal(self):
+    def test_ccar_proposes_with_original_labels_before_update(self):
         events = []
 
         class RecordingCCAR:
@@ -87,11 +88,49 @@ class ObjectiveTests(unittest.TestCase):
             RecordingCCAR(), torch.randn(2, 3), original,
             torch.tensor([0.2, 0.8]), torch.randn(2, 2), True)
 
-        self.assertEqual([event[0] for event in events], ['update', 'propose'])
+        self.assertEqual([event[0] for event in events], ['propose', 'update'])
         torch.testing.assert_close(events[0][1], original)
         torch.testing.assert_close(events[1][1], original)
         torch.testing.assert_close(corrected, torch.tensor([1, 1]))
         torch.testing.assert_close(original, torch.tensor([0, 1]))
+
+    def test_ccar_only_updates_before_relabeling_is_enabled(self):
+        events = []
+
+        class RecordingCCAR:
+            def update(self, _embeddings, labels):
+                events.append(('update', labels.clone()))
+
+            def propose(self, _embeddings, labels, _importance, _logits):
+                events.append(('propose', labels.clone()))
+                return torch.tensor([True]), torch.tensor([1])
+
+        original = torch.tensor([0])
+        targets = ccar_batch_targets(
+            RecordingCCAR(), torch.randn(1, 3), original,
+            torch.tensor([0.5]), torch.randn(1, 2), False)
+
+        self.assertEqual([event[0] for event in events], ['update'])
+        torch.testing.assert_close(events[0][1], original)
+        self.assertIs(targets, original)
+
+    def test_ccar_decision_uses_the_preupdate_prototypes(self):
+        ccar = ClusterContrastiveRelabeler(
+            num_classes=2, feature_dim=1, momentum=0.0,
+            temperature=0.1, beta=0.2, gamma=0.0, alpha=0.4)
+        ccar.update(
+            torch.tensor([[0.0], [10.0]]), torch.tensor([0, 1]))
+
+        targets = ccar_batch_targets(
+            ccar,
+            torch.tensor([[9.0]]),
+            torch.tensor([0]),
+            torch.tensor([0.5]),
+            torch.tensor([[0.0, 0.30228087]]),
+            relabel_enabled=True)
+
+        torch.testing.assert_close(targets, torch.tensor([1]))
+        torch.testing.assert_close(ccar.prototypes[0], torch.tensor([9.0]))
 
 
 if __name__ == '__main__':
