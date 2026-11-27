@@ -93,6 +93,65 @@ class ObjectiveTests(unittest.TestCase):
         torch.testing.assert_close(corrected, torch.tensor([1, 1]))
         torch.testing.assert_close(original, torch.tensor([0, 1]))
 
+    def test_ccar_oracle_filter_only_updates_eligible_samples(self):
+        events = []
+
+        class RecordingCCAR:
+            def update(self, embeddings, labels):
+                events.append(('update', embeddings.clone(), labels.clone()))
+
+            def propose(self, embeddings, labels, _importance, _logits):
+                events.append(('propose', embeddings.clone(), labels.clone()))
+                return torch.zeros(labels.shape, dtype=torch.bool), labels
+
+        embeddings = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        labels = torch.tensor([0, 1, 2])
+        mask = torch.tensor([True, False, True])
+        targets = ccar_batch_targets(
+            RecordingCCAR(), embeddings, labels,
+            torch.tensor([0.2, 0.5, 0.8]), torch.randn(3, 3), True,
+            prototype_update_mask=mask)
+
+        self.assertEqual([event[0] for event in events], ['update', 'propose'])
+        torch.testing.assert_close(events[0][1], embeddings[mask])
+        torch.testing.assert_close(events[0][2], labels[mask])
+        torch.testing.assert_close(events[1][1], embeddings)
+        torch.testing.assert_close(events[1][2], labels)
+        torch.testing.assert_close(targets, labels)
+
+    def test_ccar_oracle_filter_keeps_old_prototypes_for_empty_selection(self):
+        events = []
+
+        class RecordingCCAR:
+            def update(self, _embeddings, _labels):
+                events.append('update')
+
+            def propose(self, _embeddings, labels, _importance, _logits):
+                events.append('propose')
+                return torch.zeros(labels.shape, dtype=torch.bool), labels
+
+        labels = torch.tensor([0, 1])
+        ccar_batch_targets(
+            RecordingCCAR(), torch.randn(2, 3), labels,
+            torch.tensor([0.2, 0.8]), torch.randn(2, 2), True,
+            prototype_update_mask=torch.zeros(2, dtype=torch.bool))
+        self.assertEqual(events, ['propose'])
+
+    def test_ccar_oracle_filter_validates_mask(self):
+        class NoOpCCAR:
+            def update(self, _embeddings, _labels):
+                pass
+
+        common = (
+            NoOpCCAR(), torch.randn(2, 3), torch.tensor([0, 1]),
+            torch.tensor([0.2, 0.8]), torch.randn(2, 2), False)
+        with self.assertRaisesRegex(ValueError, 'boolean'):
+            ccar_batch_targets(
+                *common, prototype_update_mask=torch.ones(2))
+        with self.assertRaisesRegex(ValueError, 'label shape'):
+            ccar_batch_targets(
+                *common, prototype_update_mask=torch.ones(1, dtype=torch.bool))
+
 
 if __name__ == '__main__':
     unittest.main()

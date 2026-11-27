@@ -6,6 +6,7 @@ import torch.nn as nn
 from train_rafdb import (
     CHECKPOINT_FORMAT_VERSION,
     MinimumSizeBatchSampler,
+    PROTOTYPE_UPDATE_POLICY,
     checkpoint_state_dict,
     load_shape_compatible_state,
     method_contract,
@@ -48,6 +49,9 @@ class CheckpointContractTests(unittest.TestCase):
         args = self.args()
         checkpoint = self.checkpoint(args)
         validate_resume_checkpoint(checkpoint, args)
+        self.assertEqual(
+            checkpoint['method_contract']['prototype_update_policy'],
+            PROTOTYPE_UPDATE_POLICY)
 
         with self.assertRaisesRegex(ValueError, 'not a V2 checkpoint'):
             validate_resume_checkpoint({}, args)
@@ -55,6 +59,12 @@ class CheckpointContractTests(unittest.TestCase):
         mismatched = dict(checkpoint)
         mismatched['method_contract'] = dict(checkpoint['method_contract'])
         mismatched['method_contract']['embedding_dim'] = 32
+        with self.assertRaisesRegex(ValueError, 'method contract mismatch'):
+            validate_resume_checkpoint(mismatched, args)
+
+        mismatched = dict(checkpoint)
+        mismatched['method_contract'] = dict(checkpoint['method_contract'])
+        mismatched['method_contract']['prototype_update_policy'] = 'all_samples'
         with self.assertRaisesRegex(ValueError, 'method contract mismatch'):
             validate_resume_checkpoint(mismatched, args)
 

@@ -3,6 +3,49 @@
 All notable changes are documented here. Version branches are preserved rather
 than overwritten so each research-code state remains auditable.
 
+## [2.0.0-experiment.b-oracle-filter]
+
+Branch: `experiment-b-oracle-filter`
+Baseline: `version-2-paper-alignment@dd772ae`
+
+### Changed
+
+- Restricted Equation (7) prototype updates to training samples whose noisy
+  label equals the corresponding clean label.
+- Retained only a boolean eligibility flag after comparing the two label files;
+  clean class values cannot reach AUEM, DSRUC, CCAR classification, `Pgt`, or
+  batch-local relabel targets.
+- Preserved the V2 update-before-propose order so this branch isolates prototype
+  contamination from the self-inclusion/order hypothesis tested separately by
+  Experiment C.
+- Added the oracle prototype policy to the checkpoint method contract, making
+  baseline and differently ordered checkpoints fail fast on resume.
+
+### Added
+
+- Added startup, per-epoch, and split-manifest audit counts for oracle-eligible
+  prototype samples by observed noisy-label class.
+- Added regression tests for partial and empty oracle selections, mask
+  validation, full-batch proposal behavior, split-label isolation, and
+  checkpoint policy incompatibility.
+- Added a server-use guide with the controlled Experiment B command.
+
+### Limitations
+
+- This is an oracle upper-bound diagnostic that requires clean training labels.
+  It is not a deployable noisy-label method and its accuracy must not be
+  presented as the final DSRUL result.
+- Prototype update still occurs before relabel proposal, exactly as in the V2
+  baseline. The ordering hypothesis is outside this branch.
+- Full RAF-DB training has not been run from this branch.
+
+### Validation
+
+- Verified on 2026-11-27 with Python 3.13.11 and PyTorch 2.9.1+cu128.
+- `python -m compileall -q src` passed.
+- `python -m unittest discover -s src -p "test_*.py" -v` passed all 21 tests.
+- `python src/train_rafdb.py --help` and `git diff --check` passed.
+
 ## [Unreleased]
 
 Target version: `2.0.0`

@@ -75,10 +75,31 @@ cross-entropies are added with equal coefficient.
 
 ## CCAR
 
-Each class prototype is initialized from the first observed batch mean and is
-then updated using an exponential moving average. Classes absent from the
-current batch retain their previous prototype. Relabeling is disabled until the
-given class and at least one other class have initialized prototypes.
+### Experiment B oracle update policy
+
+This branch changes only which samples may contribute to Equation (7). During
+split construction, each noisy training label is compared with its clean
+counterpart. The comparison is reduced immediately to a boolean eligibility
+flag. Only eligible embeddings update the prototype belonging to their noisy
+label. The clean class value is not retained by the training dataset and cannot
+enter any loss or relabeling target.
+
+The policy is an oracle diagnostic for measuring the possible performance lost
+to prototype contamination. It requires clean training annotations and is not
+a deployable algorithm. All training samples, including oracle-ineligible
+samples, remain active in AUEM, DSRUC, and CCAR classification.
+
+The original V2 order is deliberately unchanged: eligible current-batch
+features update prototypes first, then those updated prototypes are used to
+propose current-batch relabels. A class with no eligible feature in a batch
+keeps its previous prototype. Experiment C, not this branch, tests proposal
+before update.
+
+Each class prototype is initialized from the first eligible batch mean and is
+then updated using an exponential moving average. Classes with no eligible
+sample in the current batch retain their previous prototype. Relabeling is
+disabled until the given class and at least one other class have initialized
+prototypes.
 
 For original label `y`, CCAR computes Euclidean distance to the `y` prototype
 and to the closest initialized non-`y` prototype. The geometric score is:

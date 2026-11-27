@@ -90,9 +90,20 @@ def dsruc_loss(embeddings, uncertainty, labels, classifier,
 
 
 def ccar_batch_targets(ccar, embeddings, original_labels, importance, logits,
-                       relabel_enabled):
-    """Update Equation (7) before applying Equations (8)-(12)."""
-    ccar.update(embeddings, original_labels)
+                       relabel_enabled, prototype_update_mask=None):
+    """Update Equation (7) before relabeling, optionally with oracle filtering."""
+    if prototype_update_mask is None:
+        ccar.update(embeddings, original_labels)
+    else:
+        if prototype_update_mask.dtype != torch.bool:
+            raise ValueError('prototype_update_mask must be boolean')
+        if prototype_update_mask.shape != original_labels.shape:
+            raise ValueError(
+                'prototype_update_mask must match the label shape')
+        if prototype_update_mask.any():
+            ccar.update(
+                embeddings[prototype_update_mask],
+                original_labels[prototype_update_mask])
     if not relabel_enabled:
         return original_labels
 

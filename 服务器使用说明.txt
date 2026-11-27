@@ -1,0 +1,82 @@
+DSRUL 实验 B 服务器使用说明
+
+版本：2.0.0-experiment.b-oracle-filter
+Git 分支：experiment-b-oracle-filter
+共同基线：version-2-paper-alignment@dd772ae
+
+一、实验目的
+
+本分支只验证一个问题：如果错误标签样本不再参与类别原型更新，CCAR 的效果是否改善。
+
+训练脚本会比较 0.1noise_train.txt 与 list_patition_label.txt。只有两个标签一致的训练样本可以更新原型。干净类别值不会进入分类损失、DSRUC、Pgt 或重标目标；全部训练样本仍正常参与其他损失。
+
+这是使用干净训练标签的 oracle 上界诊断，不是可部署方法，也不能直接作为论文最终方法结果。
+
+二、服务器目录要求
+
+数据目录应包含：
+
+/新数据集/raf-basic/EmoLabel/0.1noise_train.txt
+/新数据集/raf-basic/EmoLabel/list_patition_label.txt
+/新数据集/raf-basic/Image/aligned/
+/新数据集/ijba_res18_naive.pth.tar
+
+三、推荐训练命令
+
+上传后先在代码根目录执行：
+
+/DSRUL_code/.venv/bin/python3 -m unittest discover -s src -p "test_*.py" -v
+/DSRUL_code/.venv/bin/python3 src/train_rafdb.py --help
+
+请把 save_dir 末尾时间改为本次实际启动时间，避免覆盖其他实验，然后执行：
+
+/DSRUL_code/.venv/bin/python3 src/train_rafdb.py \
+  --raf_path /新数据集/raf-basic \
+  --train_label_file 0.1noise_train.txt \
+  --clean_label_file list_patition_label.txt \
+  --pretrained /新数据集/ijba_res18_naive.pth.tar \
+  --save_dir /result/rafdb_noise0.1_experiment_b_oracle_filter_YYYYMMDD_HHMMSS \
+  --val_ratio 0.1 \
+  --split_seed 0 \
+  --target_val_accuracy 1.1 \
+  --batch_size 256 \
+  --workers 1 \
+  --epochs 100 \
+  --optimizer adam \
+  --lr 0.0002 \
+  --weight_decay 0.0001 \
+  --lr_scheduler exponential \
+  --lr_decay_gamma 0.99 \
+  --train_sampler shuffle \
+  --drop_rate 0.2 \
+  --rotation_degrees 0 \
+  --ema_decay 0 \
+  --relabel_epoch 8 \
+  --beta 0.2 \
+  --gamma 0.6 \
+  --alpha 0.4 \
+  --prototype_momentum 0.9 \
+  --ccar_temperature 0.1 \
+  --margin_1 0.5 \
+  --out_dimension 64
+
+四、运行前检查
+
+1. 确认当前目录 VERSION 内容为 2.0.0-experiment.b-oracle-filter。
+2. 确认日志开头的 Implementation version 为 2.0.0-experiment.b-oracle-filter，并且 Method contract 中的 prototype_update_policy 为 oracle_clean_filter_update_before_propose。
+3. 确认日志打印 Oracle-filter prototype candidates 以及各观测类别的候选数量。
+4. 不要使用基线或实验 C 的 checkpoint 续训。本分支会通过 method contract 拒绝不兼容 checkpoint。
+
+五、需要保存的结果
+
+请完整保存：
+
+1. 终端训练日志。
+2. save_dir 下的 best.pth。
+3. save_dir 下的 split_manifest.json。
+4. 最终官方测试准确率、测试 loss、Selected epoch 和 Best validation accuracy。
+5. 每轮 Oracle-filter prototype updates 统计。
+
+六、对照要求
+
+与基线和实验 C 对照时，必须保持预训练权重、split_seed、batch size、优化器、学习率、训练轮数、relabel_epoch、增强和 EMA 设置一致。该命令采用前一轮 run7-style 配置：第 8 轮启用重标、关闭旋转、关闭验证 EMA。

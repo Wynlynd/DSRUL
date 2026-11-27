@@ -25,6 +25,7 @@ torch.cuda.empty_cache()
 CHECKPOINT_FORMAT_VERSION = 2
 IMPORTANCE_SOURCE = 'normalized_mu'
 UNCERTAINTY_REPRESENTATION = 'pairwise_normalized_vector_mean'
+PROTOTYPE_UPDATE_POLICY = 'oracle_clean_filter_update_before_propose'
 RESUME_MUTABLE_FIELDS = frozenset({
     'checkpoint', 'pretrained', 'save_dir', 'skip_test_eval',
     'target_val_accuracy',
@@ -109,6 +110,7 @@ def method_contract(args):
         'importance_source': IMPORTANCE_SOURCE,
         'embedding_dim': args.out_dimension,
         'uncertainty_representation': UNCERTAINTY_REPRESENTATION,
+        'prototype_update_policy': PROTOTYPE_UPDATE_POLICY,
         'backbone': 'resnet18',
     }
 
@@ -310,7 +312,11 @@ def make_raf_splits(raf_path, train_label_file, clean_label_file, val_ratio, spl
 
     train_names = [name for name in clean_train.index if name not in validation_names]
     val_names = [name for name in clean_train.index if name in validation_names]
-    train_records = noisy_train.loc[train_names].reset_index()
+    train_records = noisy_train.loc[train_names].copy()
+    clean_train_labels = clean_train.loc[train_names, 'label'].to_numpy()
+    train_records['prototype_update_eligible'] = (
+        train_records['label'].to_numpy() == clean_train_labels)
+    train_records = train_records.reset_index()
     val_records = clean_train.loc[val_names].reset_index()
     test_records = clean_test.reset_index()
     return train_records, val_records, test_records
@@ -324,6 +330,12 @@ class RafDataSet(data.Dataset):
 
         file_names = records['name'].to_numpy()
         self.label = records['label'].to_numpy(dtype=np.int64, copy=True) - 1
+        if 'prototype_update_eligible' in records:
+            eligible = records['prototype_update_eligible'].to_numpy(
+                dtype=np.bool_, copy=True)
+        else:
+            eligible = np.ones(len(records), dtype=np.bool_)
+        self.prototype_update_eligible = torch.as_tensor(eligible)
 
         self.file_paths = []
         # use raf aligned images for training/testing
@@ -427,6 +439,8 @@ def run_training():
     if args.checkpoint and args.pretrained:
         raise ValueError('--checkpoint and --pretrained cannot be used together.')
     print(args)
+    print('Implementation version:', implementation_version())
+    print('Method contract:', method_contract(args))
     resume_checkpoint = None
     if args.checkpoint:
         resume_checkpoint = torch.load(
@@ -483,12 +497,30 @@ def run_training():
     train_records, val_records, test_records = make_raf_splits(
         args.raf_path, args.train_label_file, args.clean_label_file,
         args.val_ratio, args.split_seed)
+    eligible_records = train_records['prototype_update_eligible']
+    eligible_by_class = [
+        int(((train_records['label'] == class_id) & eligible_records).sum())
+        for class_id in range(1, 8)
+    ]
+    observed_by_class = [
+        int((train_records['label'] == class_id).sum())
+        for class_id in range(1, 8)
+    ]
+    eligible_count = int(eligible_records.sum())
+    print('Oracle-filter prototype candidates: {}/{} ({:.2%})'.format(
+        eligible_count, len(train_records), eligible_count / len(train_records)))
+    print('Oracle-filter eligible by observed class:', eligible_by_class)
+    print('Observed training samples by class:', observed_by_class)
     with open(os.path.join(save_folder, 'split_manifest.json'), 'w', encoding='utf-8') as manifest:
         json.dump({
             'train_label_file': args.train_label_file,
             'clean_label_file': args.clean_label_file,
             'val_ratio': args.val_ratio,
             'split_seed': args.split_seed,
+            'prototype_update_policy': PROTOTYPE_UPDATE_POLICY,
+            'prototype_update_eligible_count': eligible_count,
+            'prototype_update_eligible_by_observed_class': eligible_by_class,
+            'observed_training_samples_by_class': observed_by_class,
             'train_names': train_records['name'].tolist(),
             'validation_names': val_records['name'].tolist(),
             'test_names': test_records['name'].tolist(),
@@ -625,9 +657,10 @@ def run_training():
         correct_sum = 0
         iter_cnt = 0
         train_sample_count = 0
+        prototype_update_by_class = torch.zeros(7, dtype=torch.long)
         res18.train()
         fc.train()
-        for batch_i, (imgs, targets, _) in enumerate(train_loader):
+        for batch_i, (imgs, targets, sample_indices) in enumerate(train_loader):
             batch_sz = imgs.size(0)
             train_sample_count += batch_sz
             iter_cnt += 1
@@ -635,6 +668,11 @@ def run_training():
 
             imgs = imgs.cuda()
             targets = targets.cuda()
+            prototype_update_mask = train_dataset.prototype_update_eligible[
+                sample_indices].to(device=targets.device, non_blocking=True)
+            if prototype_update_mask.any():
+                prototype_update_by_class += torch.bincount(
+                    targets[prototype_update_mask].detach().cpu(), minlength=7)
             mu, uncertainties, importance = res18(imgs, phase='train', return_importance=True)
             importance = importance.squeeze(1)
             high_uncertainty_idx, low_uncertainty_idx = split_uncertainty_regions(
@@ -649,7 +687,8 @@ def run_training():
                 high_uncertainty_idx, low_uncertainty_idx)
             ccar_targets = ccar_batch_targets(
                 ccar, mu, targets, importance, outputs,
-                relabel_enabled=i >= args.relabel_epoch)
+                relabel_enabled=i >= args.relabel_epoch,
+                prototype_update_mask=prototype_update_mask)
 
             # Equations (13)-(14): scaled-logit CCAR plus AUEM and DSRUC.
             loss = (ccar_loss(outputs, ccar_targets, importance)
@@ -667,6 +706,9 @@ def run_training():
         running_loss = running_loss / iter_cnt
         print('[Epoch %d] Training accuracy: %.4f. Loss: %.3f. LR: %.8g' % (
             i, acc, running_loss, epoch_lr))
+        print('[Epoch %d] Oracle-filter prototype updates: %d/%d; by observed class: %s' % (
+            i, int(prototype_update_by_class.sum()), train_sample_count,
+            prototype_update_by_class.tolist()))
 
         raw_res18_state = clone_state_dict_to_cpu(res18.state_dict())
         raw_fc_state = clone_state_dict_to_cpu(fc.state_dict())

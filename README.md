@@ -3,18 +3,25 @@
 Reference implementation of **DSRUL: A Novel Adaptive Dual-Stream Relative
 Uncertainty Learning Method for Facial Expression Recognition**.
 
-> **Version:** `2.0.0-dev` (Version 2 development)
+> **Version:** `2.0.0-experiment.b-oracle-filter`
 >
-> **Branch:** `version-2-paper-alignment`
+> **Branch:** `experiment-b-oracle-filter`
+>
+> **Baseline:** `version-2-paper-alignment@dd772ae`
 >
 > **Stable baseline:** [`main@0d5f3a2`](https://github.com/Wynlynd/DSRUL/tree/0d5f3a2d11d151d90ebb40f9462cead7a292b350)
 >
 > **Changes:** [CHANGELOG.md](CHANGELOG.md)
 
-> **Status:** V2 aligns the AUEM importance path with Equation (1), adds
+> **Status:** This is diagnostic Experiment B built on V2. It uses the clean
+> RAF-DB labels only to decide whether a noisy-label training sample may update
+> a class prototype. Clean class values never become classification, DSRUC, or
+> relabeling targets. This oracle filter is not deployable without clean labels
+> and must not be reported as the final method. V2 aligns the AUEM importance
+> path with Equation (1), adds
 > equation-level regression tests, and versions the checkpoint contract. This
 > snapshot contains the corrected RAF-DB training path
-> for AUEM, DSRUC, and CCAR. All 17 focused V2 tests, source compilation, and
+> for AUEM, DSRUC, and CCAR. The focused component tests, source compilation, and
 > CLI checks pass in the environment recorded in the changelog. Full-dataset
 > training and the numerical results reported in the manuscript have not yet
 > been reproduced from this repository snapshot.
@@ -38,6 +45,33 @@ The current RAF-DB implementation combines three components:
 
 CCAR corrections are batch-local targets for the CCAR classification loss.
 The original dataset labels are not permanently overwritten.
+
+## Experiment B Oracle Prototype Filter
+
+The experiment tests one narrow hypothesis: whether mislabeled samples entering
+Equation (7) materially limit CCAR. For each training image, the clean and noisy
+label files are compared once while building the fixed split. Only their
+equality is retained as a boolean `prototype_update_eligible` flag; the clean
+class value is discarded before the dataset and training loop are constructed.
+
+The active order remains the V2 baseline order:
+
+```text
+filter current batch by noisy_label == clean_label
+-> update prototypes with eligible embeddings grouped by noisy label
+-> propose batch-local relabeling from the updated prototypes
+```
+
+All samples still participate in AUEM, DSRUC, and CCAR classification. Samples
+excluded from the prototype update are not removed from training. The noisy
+label remains the original label used by the losses, `Pgt`, and relabeling
+logic. When a batch has no eligible sample for a class, that class retains its
+previous prototype. Startup logs, per-epoch logs, and `split_manifest.json`
+record the eligible totals and observed-class counts.
+
+This branch intentionally does not fix update-before-propose self-inclusion;
+that is isolated in Experiment C. Comparing the two branches therefore keeps
+the two hypotheses separate.
 
 ## Supported Scope
 
@@ -120,6 +154,10 @@ train_00002.jpg 2
 The noisy and clean files must contain the same `train*` images. The clean
 file must also contain the official `test*` images. The training script reports
 the observed noisy-label ratio before training.
+
+On this experimental branch, the clean training labels are additionally used
+by the oracle prototype filter. This is deliberate label leakage for an upper-
+bound diagnostic, not a valid deployment assumption.
 
 The official training partition is split into a fixed, class-stratified train
 and clean-validation split. Defaults are `--val_ratio 0.1` and
@@ -259,6 +297,7 @@ matching environment, dataset/noise protocol, checkpoint, seed, and run logs.
 
 | Version | Branch/baseline | Main change |
 | --- | --- | --- |
+| `2.0.0-experiment.b-oracle-filter` | `experiment-b-oracle-filter`, based on `dd772ae` | Diagnostic oracle filter: only training samples whose noisy and clean labels agree may update prototypes; all losses retain noisy labels and update-before-propose remains unchanged. |
 | `2.0.0-dev` | `version-2-paper-alignment` | Computes AUEM importance from normalized `mu`, restores vector uncertainty for DSRUC, adds regression coverage for the documented V2 interpretations, and adds versioned checkpoints. No paper accuracy is claimed. |
 | V1 baseline | `main@0d5f3a2` | First public RAF-DB path with AUEM, DSRUC, CCAR, validation checkpointing, and explicit reproducibility limits. |
 
