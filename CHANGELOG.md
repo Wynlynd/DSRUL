@@ -3,6 +3,46 @@
 All notable changes are documented here. Version branches are preserved rather
 than overwritten so each research-code state remains auditable.
 
+## [2.0.0-experiment.d-oracle-soft-diagnostics] - 2026-11-28
+
+Branch: `experiment-d-oracle-soft-diagnostics`
+Baseline: `experiment-c-preupdate-proposal@ec77f6f`
+
+### Added
+
+- Added a unified `--ccar_variant` switch for A baseline, C preupdate, and D
+  oracle-soft experiments without maintaining divergent training loops.
+- Added `--seed`, explicitly seeded samplers/workers, and separate recording of
+  the fixed split seed and training seed.
+- Added weighted observed-class prototype centers. D uses weight 1.0 for clean
+  samples and `--oracle_noisy_weight` (default 0.5) for known noisy samples.
+- Added JSONL relabel/prototype/loss diagnostics, validation/test macro-F1,
+  balanced accuracy, per-class recall and confusion matrices, plus ordered
+  final-test prediction export.
+- Added a controlled A/C/D three-seed server matrix script and regression tests
+  for update order, weighted centers, metric calculations, relabel quality,
+  seed repeatability, and resume identity.
+- Vectorized per-class prototype aggregation to avoid batch-level GPU
+  synchronization, and aligned JSONL history to the checkpoint epoch on resume.
+
+### Boundaries
+
+- Clean labels are detached diagnostics for A/C. D additionally uses them only
+  to choose prototype weights; clean labels never become loss targets.
+- D is an oracle mechanism test, not a deployable method.
+- Full checkpoints from A, C, and D are mutually incompatible when their method
+  contracts differ; shape-compatible warm starts remain supported.
+
+### Validation
+
+- `python -m compileall -q src` passed.
+- `python -m unittest discover -s src -p "test_*.py" -v` passed all 29 tests,
+  including CUDA paths.
+- `python src/train_rafdb.py --help` and `git diff --check` passed.
+- A one-epoch CUDA RAF-DB `oracle_soft` smoke run completed and produced a
+  checkpoint, JSONL metrics, run manifest, and split manifest.
+- Full repeated-seed RAF-DB training remains pending.
+
 ## [2.0.0-experiment.c-preupdate-proposal] - 2026-11-27
 
 Branch: `experiment-c-preupdate-proposal`

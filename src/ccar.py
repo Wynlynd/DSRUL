@@ -29,18 +29,47 @@ class ClusterContrastiveRelabeler(nn.Module):
         self.register_buffer('initialized', torch.zeros(num_classes, dtype=torch.bool))
 
     @torch.no_grad()
-    def update(self, features, labels):
-        """Equation (7): update only classes present in the current batch."""
+    def update(self, features, labels, weights=None):
+        """Update present-class prototypes, optionally using sample weights."""
         features = features.detach()
-        for class_id in labels.unique().tolist():
-            batch_center = features[labels == class_id].mean(dim=0)
-            if self.initialized[class_id]:
-                self.prototypes[class_id].mul_(self.momentum).add_(
-                    batch_center, alpha=1 - self.momentum)
-            else:
-                # The paper leaves P_c^(0) unspecified; the first batch mean is unbiased.
-                self.prototypes[class_id].copy_(batch_center)
-                self.initialized[class_id] = True
+        if weights is not None:
+            if weights.ndim != 1 or weights.shape[0] != features.shape[0]:
+                raise ValueError('weights must have shape [batch]')
+            weights = weights.detach().to(
+                device=features.device, dtype=features.dtype)
+            valid_weights = torch.isfinite(weights).all() & (weights >= 0).all()
+            if weights.is_cuda:
+                torch._assert_async(
+                    valid_weights, 'weights must be finite and non-negative')
+            elif not valid_weights:
+                raise ValueError('weights must be finite and non-negative')
+        else:
+            weights = torch.ones(
+                features.shape[0], device=features.device,
+                dtype=features.dtype)
+
+        num_classes = self.prototypes.shape[0]
+        weight_sums = torch.zeros(
+            num_classes, device=features.device, dtype=features.dtype)
+        weighted_feature_sums = torch.zeros(
+            num_classes, features.shape[1], device=features.device,
+            dtype=features.dtype)
+        weight_sums.index_add_(0, labels, weights)
+        weighted_feature_sums.index_add_(
+            0, labels, features * weights.unsqueeze(1))
+
+        present = weight_sums > 0
+        denominators = torch.where(
+            present, weight_sums, torch.ones_like(weight_sums))
+        batch_centers = weighted_feature_sums / denominators.unsqueeze(1)
+        updated = torch.where(
+            self.initialized.unsqueeze(1),
+            self.prototypes * self.momentum
+            + batch_centers * (1 - self.momentum),
+            batch_centers)
+        self.prototypes.copy_(torch.where(
+            present.unsqueeze(1), updated, self.prototypes))
+        self.initialized.logical_or_(present)
 
     @torch.no_grad()
     def thresholds(self, features, labels, importance):

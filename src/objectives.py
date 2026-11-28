@@ -90,18 +90,42 @@ def dsruc_loss(embeddings, uncertainty, labels, classifier,
 
 
 def ccar_batch_targets(ccar, embeddings, original_labels, importance, logits,
-                       relabel_enabled):
-    """Use the previous prototypes for relabeling, then update them."""
+                       relabel_enabled, variant='preupdate',
+                       prototype_weights=None, return_diagnostics=False):
+    """Build batch-local CCAR targets for the selected prototype variant."""
+    if variant not in ('baseline', 'preupdate', 'oracle_soft'):
+        raise ValueError('Unknown CCAR variant: {}'.format(variant))
+
+    def update_prototypes():
+        if prototype_weights is None:
+            ccar.update(embeddings, original_labels)
+        else:
+            ccar.update(embeddings, original_labels, weights=prototype_weights)
+
     if not relabel_enabled:
-        ccar.update(embeddings, original_labels)
-        return original_labels
+        update_prototypes()
+        relabel_mask = torch.zeros_like(original_labels, dtype=torch.bool)
+        predicted_labels = original_labels.clone()
+        corrected_labels = original_labels
+    else:
+        if variant == 'baseline':
+            update_prototypes()
+            relabel_mask, predicted_labels = ccar.propose(
+                embeddings, original_labels, importance, logits)
+        else:
+            relabel_mask, predicted_labels = ccar.propose(
+                embeddings, original_labels, importance, logits)
+            update_prototypes()
 
-    relabel_mask, predicted_labels = ccar.propose(
-        embeddings, original_labels, importance, logits)
-    ccar.update(embeddings, original_labels)
-    if not relabel_mask.any():
-        return original_labels
+        if relabel_mask.any():
+            corrected_labels = original_labels.clone()
+            corrected_labels[relabel_mask] = predicted_labels[relabel_mask]
+        else:
+            corrected_labels = original_labels
 
-    corrected_labels = original_labels.clone()
-    corrected_labels[relabel_mask] = predicted_labels[relabel_mask]
-    return corrected_labels
+    if not return_diagnostics:
+        return corrected_labels
+    return corrected_labels, {
+        'relabel_mask': relabel_mask.detach(),
+        'predicted_labels': predicted_labels.detach(),
+    }

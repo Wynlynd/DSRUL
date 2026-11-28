@@ -114,6 +114,68 @@ class ObjectiveTests(unittest.TestCase):
         torch.testing.assert_close(events[0][1], original)
         self.assertIs(targets, original)
 
+    def test_baseline_updates_before_proposal(self):
+        events = []
+
+        class RecordingCCAR:
+            def update(self, _embeddings, _labels):
+                events.append('update')
+
+            def propose(self, _embeddings, _labels, _importance, _logits):
+                events.append('propose')
+                return torch.tensor([False]), torch.tensor([0])
+
+        ccar_batch_targets(
+            RecordingCCAR(), torch.randn(1, 3), torch.tensor([0]),
+            torch.tensor([0.5]), torch.randn(1, 2), True,
+            variant='baseline')
+
+        self.assertEqual(events, ['update', 'propose'])
+
+    def test_oracle_soft_forwards_weights_without_changing_observed_target(self):
+        events = []
+
+        class RecordingCCAR:
+            def update(self, _embeddings, labels, weights=None):
+                events.append(('update', labels.clone(), weights.clone()))
+
+            def propose(self, _embeddings, labels, _importance, _logits):
+                events.append(('propose', labels.clone()))
+                return torch.tensor([False, False]), torch.tensor([1, 0])
+
+        original = torch.tensor([0, 1])
+        weights = torch.tensor([1.0, 0.5])
+        targets, details = ccar_batch_targets(
+            RecordingCCAR(), torch.randn(2, 3), original,
+            torch.tensor([0.5, 0.5]), torch.randn(2, 2), True,
+            variant='oracle_soft', prototype_weights=weights,
+            return_diagnostics=True)
+
+        self.assertEqual([event[0] for event in events], ['propose', 'update'])
+        torch.testing.assert_close(events[1][1], original)
+        torch.testing.assert_close(events[1][2], weights)
+        self.assertIs(targets, original)
+        self.assertFalse(details['relabel_mask'].any().item())
+
+    def test_all_variants_only_update_before_relabel_epoch(self):
+        for variant in ('baseline', 'preupdate', 'oracle_soft'):
+            events = []
+
+            class RecordingCCAR:
+                def update(self, _embeddings, _labels):
+                    events.append('update')
+
+                def propose(self, *_args):
+                    events.append('propose')
+                    return torch.tensor([True]), torch.tensor([1])
+
+            targets = ccar_batch_targets(
+                RecordingCCAR(), torch.randn(1, 3), torch.tensor([0]),
+                torch.tensor([0.5]), torch.randn(1, 2), False,
+                variant=variant)
+            self.assertEqual(events, ['update'])
+            torch.testing.assert_close(targets, torch.tensor([0]))
+
     def test_ccar_decision_uses_the_preupdate_prototypes(self):
         ccar = ClusterContrastiveRelabeler(
             num_classes=2, feature_dim=1, momentum=0.0,

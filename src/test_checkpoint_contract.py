@@ -1,5 +1,10 @@
 import unittest
+import random
+import json
+import tempfile
+from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -10,7 +15,9 @@ from train_rafdb import (
     load_shape_compatible_state,
     method_contract,
     parse_args,
+    prepare_metrics_file,
     restore_ema_states,
+    setup_seed,
     validate_resume_checkpoint,
 )
 
@@ -27,7 +34,7 @@ class CheckpointContractTests(unittest.TestCase):
     def checkpoint(args):
         checkpoint = {
             'checkpoint_format_version': CHECKPOINT_FORMAT_VERSION,
-            'implementation_version': '2.0.0-experiment.c-preupdate-proposal',
+            'implementation_version': '2.0.0-experiment.d-oracle-soft-diagnostics',
             'method_contract': method_contract(args),
             'config': vars(args).copy(),
             'iter': 3,
@@ -87,6 +94,14 @@ class CheckpointContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'configuration mismatch'):
             validate_resume_checkpoint(checkpoint, extended_args)
 
+        changed_seed = self.args(seed=args.seed + 1)
+        with self.assertRaisesRegex(ValueError, 'configuration mismatch'):
+            validate_resume_checkpoint(checkpoint, changed_seed)
+
+        changed_variant = self.args(ccar_variant='preupdate')
+        with self.assertRaisesRegex(ValueError, 'method contract mismatch'):
+            validate_resume_checkpoint(checkpoint, changed_variant)
+
         incomplete = dict(checkpoint)
         incomplete.pop('scheduler_state_dict')
         with self.assertRaisesRegex(ValueError, 'scheduler_state_dict'):
@@ -142,6 +157,59 @@ class CheckpointContractTests(unittest.TestCase):
         args = parse_args(['--raf_path', 'raf-basic'])
         self.assertFalse(hasattr(args, 'backbone'))
         self.assertEqual(args.out_dimension, 64)
+        self.assertEqual(args.seed, 0)
+        self.assertEqual(args.ccar_variant, 'oracle_soft')
+        self.assertEqual(args.oracle_noisy_weight, 0.5)
+        self.assertEqual(method_contract(args)['oracle_noisy_weight'], 0.5)
+
+        preupdate = self.args(ccar_variant='preupdate')
+        self.assertIsNone(method_contract(preupdate)['oracle_noisy_weight'])
+        self.assertEqual(
+            method_contract(preupdate)['prototype_update_weighting'], 'uniform')
+
+    def test_setup_seed_repeats_python_numpy_and_torch_streams(self):
+        setup_seed(17)
+        first = (random.random(), np.random.rand(), torch.rand(3))
+        setup_seed(17)
+        second = (random.random(), np.random.rand(), torch.rand(3))
+
+        self.assertEqual(first[0], second[0])
+        self.assertEqual(first[1], second[1])
+        torch.testing.assert_close(first[2], second[2])
+
+        def sample_order(seed):
+            generator = torch.Generator().manual_seed(seed)
+            sampler = torch.utils.data.RandomSampler(
+                range(20), generator=generator)
+            return list(sampler)
+
+        self.assertEqual(sample_order(17), sample_order(17))
+        self.assertNotEqual(sample_order(17), sample_order(18))
+
+    def test_resume_metrics_are_aligned_to_checkpoint_epoch(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            metrics_path = Path(temporary_directory) / 'metrics.jsonl'
+            records = [
+                {'epoch': 1, 'trajectory': 'original'},
+                {'epoch': 2, 'trajectory': 'original'},
+                {'epoch': 3, 'trajectory': 'future'},
+                {'epoch': 2, 'trajectory': 'resumed'},
+            ]
+            metrics_path.write_text(
+                ''.join(json.dumps(record) + '\n' for record in records),
+                encoding='utf-8')
+
+            prepare_metrics_file(metrics_path, {'iter': 2})
+
+            retained = [
+                json.loads(line)
+                for line in metrics_path.read_text(encoding='utf-8').splitlines()
+            ]
+            self.assertEqual([record['epoch'] for record in retained], [1, 2])
+            self.assertEqual(retained[-1]['trajectory'], 'resumed')
+
+            prepare_metrics_file(metrics_path, None)
+            self.assertEqual(metrics_path.read_text(encoding='utf-8'), '')
 
     def test_minimum_batch_sampler_merges_only_unsafe_tails(self):
         cases = {

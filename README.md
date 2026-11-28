@@ -3,44 +3,46 @@
 Reference implementation of **DSRUL: A Novel Adaptive Dual-Stream Relative
 Uncertainty Learning Method for Facial Expression Recognition**.
 
-> **Version:** `2.0.0-experiment.c-preupdate-proposal` (Experiment C)
+> **Version:** `2.0.0-experiment.d-oracle-soft-diagnostics`
 >
-> **Branch:** `experiment-c-preupdate-proposal`
+> **Branch:** `experiment-d-oracle-soft-diagnostics`
 >
-> **Experiment baseline:** [`version-2-paper-alignment@dd772ae`](https://github.com/Wynlynd/DSRUL/tree/dd772aef62e3904fb77e3a05b6648ad0290b85a2)
+> **Experiment baseline:** [`experiment-c-preupdate-proposal@ec77f6f`](https://github.com/Wynlynd/DSRUL/tree/ec77f6f)
 >
 > **Changes:** [CHANGELOG.md](CHANGELOG.md)
 
-> **Status:** This diagnostic branch changes only the CCAR operation order once
-> relabeling is enabled: the current batch is judged with the prototypes from
-> previous batches, then the prototypes are updated. It is intended to measure
-> self-inclusion bias and is not presented as the manuscript's original
-> update-before-proposal implementation. Full RAF-DB training remains pending.
+> **Status:** This branch unifies the A/C/D diagnostic matrix. Experiment D uses
+> clean training labels only to assign prototype-update weights and is an oracle
+> mechanism test, not a deployable method or a manuscript claim.
 
-## Experiment C
+## A/C/D experiment matrix
 
-The V2 baseline updates a prototype with the current batch before using that
-prototype to judge the same samples. Experiment C removes that self-inclusion:
+One entrypoint now selects the exact prototype policy with `--ccar_variant`:
 
 ```text
-before --relabel_epoch: update prototypes; keep original batch targets
-from   --relabel_epoch: propose targets with pre-update prototypes; then update
+baseline    (A): update -> propose; uniform prototype weights
+preupdate   (C): propose -> update; uniform prototype weights
+oracle_soft (D): propose -> update; clean sample weight 1.0,
+                 known noisy-label sample weight --oracle_noisy_weight (0.5)
 ```
 
-The prototype update still uses every sample's original observed training
-label. Relabeling remains batch-local and affects only `L_CCAR`; dataset labels
-are not overwritten. All AUEM, DSRUC, optimizer, scheduler, augmentation, and
-evaluation behavior is unchanged from the experiment baseline.
+Before `--relabel_epoch`, every variant only updates prototypes and retains the
+observed targets. Samples always remain assigned to their observed-label
+prototype. D lowers a known noisy sample's contribution; it never moves that
+sample to a predicted or clean class. Clean labels never become CCAR or DSRUC
+training targets. Relabeling remains batch-local and does not overwrite the
+dataset.
 
-At startup, the training log prints the implementation version and method
-contract. A valid Experiment C run must report
-`2.0.0-experiment.c-preupdate-proposal` and
-`ccar_update_order: propose_then_update_when_relabeling`.
+The startup log and `run_manifest.json` record the implementation version,
+variant, update order, weighting policy, oracle weight, split seed, and training
+seed. A valid D run reports
+`2.0.0-experiment.d-oracle-soft-diagnostics`, `oracle_soft`, and
+`prototype_update_weighting: oracle_clean_soft`.
 
-If relabeling is enabled before enough prototypes exist, CCAR's existing
-validity mask keeps those samples unchanged and the batch then initializes or
-updates the prototypes normally. "Pre-update" therefore means one batch behind,
-not one epoch behind.
+The purpose of D is narrow: test whether soft downweighting has an oracle upper
+bound after B's hard filtering reduced effective sample coverage. If D cannot
+reliably improve validation performance across seeds, prototype filtering
+should not be expanded into a more complex deployable method.
 
 ## Overview
 
@@ -85,12 +87,14 @@ values are not traceable to versioned run artifacts.
 |-- CHANGELOG.md
 |-- README.md
 |-- requirements.txt
+|-- run_rafdb_matrix.sh     # Controlled A/C/D multi-seed runner
 |-- docs/
 |   `-- implementation-notes.md
 `-- src/
     |-- train_rafdb.py       # Primary RAF-DB training entrypoint
     |-- resnet.py            # ResNet-18, uncertainty, and importance branches
     |-- ccar.py              # Prototype, threshold, relabeling, and CCAR loss
+    |-- diagnostics.py       # Relabel, prototype, and class-metric diagnostics
     |-- objectives.py        # Equation-aligned AUEM/DSRUC target helpers
     |-- image_utils.py       # Image augmentation helpers
     `-- test_*.py            # Formula, model, checkpoint, and CCAR tests
@@ -147,6 +151,8 @@ the observed noisy-label ratio before training.
 The official training partition is split into a fixed, class-stratified train
 and clean-validation split. Defaults are `--val_ratio 0.1` and
 `--split_seed 0`; the exact image lists are saved in `split_manifest.json`.
+`--seed` is separate and controls initialization, sampling, workers, and data
+augmentation. Keep `--split_seed 0` fixed while comparing training seeds.
 
 ## Pretrained Weights
 
@@ -173,6 +179,10 @@ python src/train_rafdb.py \
   --train_label_file 0.1noise_train.txt \
   --clean_label_file list_patition_label.txt \
   --pretrained /path/to/ijba_res18_naive.pth.tar \
+  --ccar_variant oracle_soft \
+  --oracle_noisy_weight 0.5 \
+  --split_seed 0 \
+  --seed 0 \
   --save_dir runs/rafdb-noise-01 \
   --batch_size 256 \
   --epochs 100 \
@@ -191,6 +201,24 @@ Important method defaults:
 | `--ccar_temperature` | `0.1` | Distance-score temperature |
 | `--relabel_epoch` | `8` | First epoch with batch-local relabeling |
 | `--margin_1` | `0.5` | AUEM regularization offset |
+| `--ccar_variant` | `oracle_soft` | Select A, C, or D behavior |
+| `--oracle_noisy_weight` | `0.5` | D-only weight for known noisy samples |
+| `--seed` | `0` | Training randomness; independent of split seed |
+
+For the controlled validation-only matrix, edit the paths at the top of
+`run_rafdb_matrix.sh`, then run it. It executes A/C/D for seeds 0, 1, and 2
+with separate output directories and `--skip_test_eval`.
+
+After selecting one configuration, use a new result directory and set
+`SKIP_TEST_EVAL=0`, for example:
+
+```bash
+SEEDS="1" VARIANTS="oracle_soft" SKIP_TEST_EVAL=0 \
+RESULT_ROOT=/result/rafdb_noise0.1_final_YYYYMMDD_HHMMSS \
+  ./run_rafdb_matrix.sh
+```
+
+The runner refuses to reuse a non-empty per-run output directory.
 
 The training batch sampler retains all samples and merges a tail that is too
 small for `BatchNorm1d` into the preceding batch. The configured batch size
@@ -218,10 +246,11 @@ python src/train_rafdb.py \
 V2 checkpoints restore the backbone, external classifier, CCAR state,
 optimizer, scheduler, epoch, and EMA history when enabled. They carry a format
 version and method contract (`normalized_mu`, embedding dimension,
-`pairwise_normalized_vector_mean`, ResNet-18, and the CCAR update order). V1
+`pairwise_normalized_vector_mean`, ResNet-18, the CCAR variant, update order,
+weighting policy, and oracle weight). V1
 checkpoints cannot be resumed because the importance and uncertainty head
-shapes changed. V2 baseline full checkpoints are also rejected because they do
-not declare the Experiment C update order. Use `--pretrained` for the restricted
+shapes changed. A/C/D full checkpoints are mutually rejected when their method
+contracts differ. Use `--pretrained` for the restricted
 warm start described above. Resume rejects
 changes to behavior-defining data, method, optimizer, scheduler, augmentation,
 and EMA settings. Resume-location/output controls, the historical warm-start
@@ -239,16 +268,24 @@ The best validation checkpoint is saved under `--save_dir`:
 ```text
 <save_dir>/
 |-- best.pth
-`-- split_manifest.json
+|-- metrics.jsonl
+|-- run_manifest.json
+|-- split_manifest.json
+|-- test_metrics.json       # omitted with --skip_test_eval
+`-- test_predictions.csv    # omitted with --skip_test_eval
 ```
 
 Unless `--skip_test_eval` is supplied, training reloads `best.pth` and performs
 one final evaluation on the official RAF-DB test split. Use
 `--skip_test_eval` during model selection to avoid repeated test-set access.
 
-Current evaluation reports cross-entropy loss and accuracy. Macro-F1, balanced
-accuracy, calibration, noise-detection quality, and relabeling precision/recall
-are not yet implemented.
+Validation and final test evaluation report accuracy, loss, macro-F1, balanced
+accuracy, per-class recall, and the confusion matrix. Each JSONL epoch also
+records the three objective terms, relabel counts and quality, per-class
+prototype norm/drift/update coverage, weight sums, and per-epoch weight ESS
+proxies. The ESS describes the update stream, not exact EMA prototype ancestry.
+Clean labels used by relabel diagnostics are detached reporting data. Final
+test predictions make paired McNemar analysis possible after model selection.
 
 ## Tests
 
@@ -261,7 +298,8 @@ python -m unittest discover -s src -p "test_*.py" -v
 They cover the `mu -> normalization -> importance` path, the documented V2
 interpretations of Equations (2)-(6), vector-uncertainty normalization and
 reduction, three-term gradient reach, prototype initialization and EMA, dynamic
-thresholds, pre-update-prototype relabel ordering, scaled-logit loss behavior,
+thresholds, all A/C/D update orders, weighted prototype centers, diagnostic
+metrics, scaled-logit loss behavior,
 warm-start filtering, and checkpoint compatibility. These tests validate
 component behavior; they do not replace full-dataset training or result
 reproduction.
@@ -275,9 +313,11 @@ reproduction.
   each term.
 - The current CCAR classification term scales each sample's logits by its
   importance before cross-entropy. It is not ordinary sample-weighted CE.
-- Experiment C changes only the relabel/update order. It does not filter noisy
-  samples from prototype updates and must not be described as a clean-prototype
-  method.
+- Experiment D has oracle access to clean/noisy membership for prototype
+  weighting. It must not be described as deployable or compared as an ordinary
+  noise-robust method without that qualification.
+- `baseline` and `preupdate` read clean labels only for detached diagnostics;
+  their optimization behavior does not use them.
 - Full RAF-DB training, repeated-seed statistics, and the manuscript tables
   remain to be reproduced and released.
 
@@ -288,6 +328,7 @@ matching environment, dataset/noise protocol, checkpoint, seed, and run logs.
 
 | Version | Branch/baseline | Main change |
 | --- | --- | --- |
+| `2.0.0-experiment.d-oracle-soft-diagnostics` | `experiment-d-oracle-soft-diagnostics`, based on `ec77f6f` | Unifies A/C/D, adds oracle-soft prototype weighting, independent training seeds, relabel/prototype diagnostics, class metrics, and prediction export. |
 | `2.0.0-experiment.c-preupdate-proposal` | `experiment-c-preupdate-proposal`, based on `dd772ae` | Uses pre-update prototypes to propose batch-local CCAR targets, then updates prototypes with the current batch. |
 | `2.0.0-dev` | `version-2-paper-alignment` | Computes AUEM importance from normalized `mu`, restores vector uncertainty for DSRUC, adds regression coverage for the documented V2 interpretations, and adds versioned checkpoints. No paper accuracy is claimed. |
 | V1 baseline | `main@0d5f3a2` | First public RAF-DB path with AUEM, DSRUC, CCAR, validation checkpointing, and explicit reproducibility limits. |

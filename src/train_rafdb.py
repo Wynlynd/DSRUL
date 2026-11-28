@@ -2,6 +2,12 @@ import math
 import numpy as np
 from resnet import resnet18
 from ccar import ClusterContrastiveRelabeler, ccar_loss
+from diagnostics import (
+    classification_metrics,
+    merge_relabel_diagnostics,
+    relabel_diagnostic_tensors,
+    relabel_diagnostics_to_python,
+)
 from objectives import (
     auem_regularization_loss,
     ccar_batch_targets,
@@ -16,6 +22,7 @@ import os, torch
 import torch.nn as nn
 import image_utils
 import argparse, random
+import csv
 import json
 from pathlib import Path
 torch.cuda.empty_cache()
@@ -49,6 +56,8 @@ def parse_args(argv=None):
                         help='Fraction of official training images reserved for clean validation.')
     parser.add_argument('--split_seed', type=int, default=0,
                         help='Seed for the fixed, class-stratified train/validation split.')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='Training seed for initialization, sampling, workers, and augmentation.')
     parser.add_argument('--save_dir', type=str, default=None,
                         help="Directory for this run's logs and best checkpoint.")
     parser.add_argument('--target_val_accuracy', type=float, default=0.885,
@@ -64,6 +73,13 @@ def parse_args(argv=None):
     parser.add_argument('--alpha', type=float, default=0.4, help='CCAR geometric adjustment (equation 11).')
     parser.add_argument('--prototype_momentum', type=float, default=0.9, help='CCAR prototype EMA coefficient.')
     parser.add_argument('--ccar_temperature', type=float, default=0.1, help='CCAR distance temperature.')
+    parser.add_argument(
+        '--ccar_variant', choices=('baseline', 'preupdate', 'oracle_soft'),
+        default='oracle_soft',
+        help='Prototype/relabel order: A baseline, C preupdate, or D oracle-soft.')
+    parser.add_argument(
+        '--oracle_noisy_weight', type=float, default=0.5,
+        help='Prototype weight for known noisy-label samples in oracle_soft mode.')
     parser.add_argument('--relabel_epoch', type=int, default=8,
                         help='Enable batch-local CCAR relabeling starting at this epoch.')
     parser.add_argument('--margin_1', type=float, default=0.5,
@@ -105,12 +121,26 @@ def implementation_version():
 
 
 def method_contract(args):
+    update_order = (
+        'update_then_propose_when_relabeling'
+        if args.ccar_variant == 'baseline'
+        else 'propose_then_update_when_relabeling'
+    )
     return {
         'importance_source': IMPORTANCE_SOURCE,
         'embedding_dim': args.out_dimension,
         'uncertainty_representation': UNCERTAINTY_REPRESENTATION,
         'backbone': 'resnet18',
-        'ccar_update_order': 'propose_then_update_when_relabeling',
+        'ccar_variant': args.ccar_variant,
+        'ccar_update_order': update_order,
+        'prototype_update_weighting': (
+            'oracle_clean_soft' if args.ccar_variant == 'oracle_soft'
+            else 'uniform'
+        ),
+        'oracle_noisy_weight': (
+            args.oracle_noisy_weight
+            if args.ccar_variant == 'oracle_soft' else None
+        ),
     }
 
 
@@ -121,6 +151,36 @@ def resume_config(config):
         name: value for name, value in sorted(values.items())
         if name not in RESUME_MUTABLE_FIELDS
     }
+
+
+def prepare_metrics_file(metrics_path, resume_checkpoint):
+    """Create a fresh JSONL file or align it with the resumed checkpoint."""
+    path = Path(metrics_path)
+    if resume_checkpoint is None or not path.exists():
+        path.write_text('', encoding='utf-8')
+        return
+
+    checkpoint_epoch = int(resume_checkpoint['iter'])
+    records_by_epoch = {}
+    with path.open('r', encoding='utf-8') as metrics_file:
+        for line_number, line in enumerate(metrics_file, start=1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            epoch = record.get('epoch')
+            if not isinstance(epoch, int):
+                raise ValueError(
+                    'metrics.jsonl line {} has no integer epoch'.format(
+                        line_number))
+            if epoch <= checkpoint_epoch:
+                records_by_epoch[epoch] = record
+
+    temporary_path = path.with_name(path.name + '.tmp')
+    with temporary_path.open('w', encoding='utf-8') as metrics_file:
+        for epoch in sorted(records_by_epoch):
+            metrics_file.write(json.dumps(
+                records_by_epoch[epoch], ensure_ascii=False) + '\n')
+    os.replace(temporary_path, path)
 
 
 def required_resume_keys(args):
@@ -243,6 +303,13 @@ def setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(_worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def clone_state_dict_to_cpu(state_dict):
@@ -312,6 +379,7 @@ def make_raf_splits(raf_path, train_label_file, clean_label_file, val_ratio, spl
     train_names = [name for name in clean_train.index if name not in validation_names]
     val_names = [name for name in clean_train.index if name in validation_names]
     train_records = noisy_train.loc[train_names].reset_index()
+    train_records['clean_label'] = clean_train.loc[train_names, 'label'].to_numpy()
     val_records = clean_train.loc[val_names].reset_index()
     test_records = clean_test.reset_index()
     return train_records, val_records, test_records
@@ -324,7 +392,14 @@ class RafDataSet(data.Dataset):
         self.raf_path = raf_path
 
         file_names = records['name'].to_numpy()
+        self.names = records['name'].tolist()
         self.label = records['label'].to_numpy(dtype=np.int64, copy=True) - 1
+        clean_label_column = (
+            records['clean_label'] if 'clean_label' in records
+            else records['label']
+        )
+        self.clean_label = clean_label_column.to_numpy(
+            dtype=np.int64, copy=True) - 1
 
         self.file_paths = []
         # use raf aligned images for training/testing
@@ -420,11 +495,13 @@ def initialize_weight_goog(m, n=''):
         m.bias.data.zero_()
 
 def run_training():
-    setup_seed(0)
-
     args = parse_args()
+    setup_seed(args.seed)
     if not 0.0 <= args.ema_decay < 1.0:
         raise ValueError('--ema_decay must be in [0, 1).')
+    if (args.ccar_variant == 'oracle_soft'
+            and not 0.0 < args.oracle_noisy_weight < 1.0):
+        raise ValueError('--oracle_noisy_weight must be in (0, 1) for oracle_soft.')
     if args.checkpoint and args.pretrained:
         raise ValueError('--checkpoint and --pretrained cannot be used together.')
     print(args)
@@ -440,6 +517,13 @@ def run_training():
         os.path.dirname(os.path.abspath(__file__)), 'runs', 'rafdb_noise0.1')
     save_folder = args.save_dir if args.save_dir else default_save_folder
     os.makedirs(save_folder, exist_ok=True)
+    with open(os.path.join(save_folder, 'run_manifest.json'), 'w',
+              encoding='utf-8') as manifest:
+        json.dump({
+            'implementation_version': implementation_version(),
+            'method_contract': method_contract(args),
+            'config': vars(args).copy(),
+        }, manifest, ensure_ascii=False, indent=2)
 
     imagenet_pretrained = False
     cuda_device_count = torch.cuda.device_count()
@@ -492,6 +576,12 @@ def run_training():
             'clean_label_file': args.clean_label_file,
             'val_ratio': args.val_ratio,
             'split_seed': args.split_seed,
+            'seed': args.seed,
+            'ccar_variant': args.ccar_variant,
+            'oracle_noisy_weight': (
+                args.oracle_noisy_weight
+                if args.ccar_variant == 'oracle_soft' else None
+            ),
             'train_names': train_records['name'].tolist(),
             'validation_names': val_records['name'].tolist(),
             'test_names': test_records['name'].tolist(),
@@ -501,6 +591,8 @@ def run_training():
                                transform=data_transforms, basic_aug=True)
 
     print('Train set size:', train_dataset.__len__())
+    sampler_generator = torch.Generator().manual_seed(args.seed)
+    train_loader_generator = torch.Generator().manual_seed(args.seed + 1)
     if args.train_sampler == 'inverse_sqrt':
         class_counts = np.bincount(train_dataset.label, minlength=7).astype(np.float64)
         if (class_counts == 0).any():
@@ -509,10 +601,11 @@ def run_training():
             np.power(class_counts[train_dataset.label], -0.5), dtype=torch.double)
         train_sampler = torch.utils.data.WeightedRandomSampler(
             sample_weights, num_samples=len(train_dataset), replacement=True,
-            generator=torch.Generator().manual_seed(0))
+            generator=sampler_generator)
         print('Inverse-sqrt sampler class counts:', class_counts.astype(int).tolist())
     else:
-        train_sampler = torch.utils.data.RandomSampler(train_dataset)
+        train_sampler = torch.utils.data.RandomSampler(
+            train_dataset, generator=sampler_generator)
 
     train_batch_sampler = MinimumSizeBatchSampler(
         train_sampler, args.batch_size, minimum_training_batch_size)
@@ -520,7 +613,9 @@ def run_training():
                                                num_workers=args.workers,
                                                batch_sampler=train_batch_sampler,
                                                pin_memory=True,
-                                               persistent_workers=args.workers > 0
+                                               persistent_workers=args.workers > 0,
+                                               worker_init_fn=seed_worker,
+                                               generator=train_loader_generator,
                                                )
 
     data_transforms_val = transforms.Compose([
@@ -539,6 +634,9 @@ def run_training():
                                              shuffle=False,
                                              pin_memory=True,
                                              persistent_workers=args.workers > 0,
+                                             worker_init_fn=seed_worker,
+                                             generator=torch.Generator().manual_seed(
+                                                 args.seed + 2),
                                              drop_last=False
                                              )
 
@@ -551,6 +649,9 @@ def run_training():
                                               shuffle=False,
                                               pin_memory=True,
                                               persistent_workers=args.workers > 0,
+                                              worker_init_fn=seed_worker,
+                                              generator=torch.Generator().manual_seed(
+                                                  args.seed + 3),
                                               drop_last=False)
 
     params = list(res18.parameters()) + list(fc.parameters())
@@ -604,23 +705,39 @@ def run_training():
         print('Resumed from epoch {}. Continuing at epoch {} from {}.'.format(
             best_epoch, start_epoch, args.checkpoint))
 
-    def evaluate(loader):
+    def evaluate(loader, include_predictions=False):
         res18.eval()
         fc.eval()
         loss_sum = 0.0
-        correct = 0
         sample_count = 0
+        all_targets = []
+        all_predictions = []
+        all_indices = []
         with torch.no_grad():
-            for imgs, targets, _ in loader:
+            for imgs, targets, indices in loader:
                 imgs = imgs.cuda()
                 targets = targets.cuda()
                 mu, _ = res18(imgs)
                 outputs = fc(mu)
                 batch_size = targets.size(0)
                 loss_sum += criterion(outputs, targets).item() * batch_size
-                correct += (outputs.argmax(dim=1) == targets).sum().item()
+                predictions = outputs.argmax(dim=1)
+                all_targets.extend(targets.cpu().tolist())
+                all_predictions.extend(predictions.cpu().tolist())
+                if include_predictions:
+                    all_indices.extend(indices.tolist())
                 sample_count += batch_size
-        return correct / sample_count, loss_sum / sample_count
+        metrics = classification_metrics(
+            all_targets, all_predictions, num_classes=7)
+        metrics['loss'] = loss_sum / sample_count
+        if include_predictions:
+            metrics['targets'] = all_targets
+            metrics['predictions'] = all_predictions
+            metrics['indices'] = all_indices
+        return metrics
+
+    metrics_path = os.path.join(save_folder, 'metrics.jsonl')
+    prepare_metrics_file(metrics_path, resume_checkpoint)
 
     for i in range(start_epoch, args.epochs + 1):
         epoch_lr = optimizer.param_groups[0]['lr']
@@ -628,9 +745,21 @@ def run_training():
         correct_sum = 0
         iter_cnt = 0
         train_sample_count = 0
+        ccar_loss_sum = 0.0
+        auem_loss_sum = 0.0
+        dsruc_loss_sum = 0.0
+        relabel_epoch_metrics = None
+        diagnostic_device = ccar.prototypes.device
+        prototype_update_count = torch.zeros(
+            7, dtype=torch.float64, device=diagnostic_device)
+        prototype_weight_sum = torch.zeros(
+            7, dtype=torch.float64, device=diagnostic_device)
+        prototype_weight_square_sum = torch.zeros(
+            7, dtype=torch.float64, device=diagnostic_device)
+        prototypes_before = ccar.prototypes.detach().clone()
         res18.train()
         fc.train()
-        for batch_i, (imgs, targets, _) in enumerate(train_loader):
+        for batch_i, (imgs, targets, sample_indices) in enumerate(train_loader):
             batch_sz = imgs.size(0)
             train_sample_count += batch_sz
             iter_cnt += 1
@@ -638,6 +767,10 @@ def run_training():
 
             imgs = imgs.cuda()
             targets = targets.cuda()
+            clean_targets = torch.as_tensor(
+                train_loader.dataset.clean_label[
+                    sample_indices.detach().cpu().numpy()],
+                device=targets.device, dtype=targets.dtype)
             mu, uncertainties, importance = res18(imgs, phase='train', return_importance=True)
             importance = importance.squeeze(1)
             high_uncertainty_idx, low_uncertainty_idx = split_uncertainty_regions(
@@ -650,26 +783,93 @@ def run_training():
             dsruc_loss_value, _ = dsruc_loss(
                 mu, uncertainties, targets, fc,
                 high_uncertainty_idx, low_uncertainty_idx)
-            ccar_targets = ccar_batch_targets(
+            prototype_weights = None
+            if args.ccar_variant == 'oracle_soft':
+                prototype_weights = torch.where(
+                    targets == clean_targets,
+                    torch.ones_like(targets, dtype=mu.dtype),
+                    torch.full_like(
+                        targets, args.oracle_noisy_weight, dtype=mu.dtype))
+            diagnostic_weights = (
+                prototype_weights if prototype_weights is not None
+                else torch.ones_like(targets, dtype=mu.dtype)
+            )
+            prototype_update_count += torch.bincount(
+                targets, minlength=7).to(torch.float64)
+            prototype_weight_sum += torch.bincount(
+                targets, weights=diagnostic_weights,
+                minlength=7).to(torch.float64)
+            prototype_weight_square_sum += torch.bincount(
+                targets, weights=diagnostic_weights.square(),
+                minlength=7).to(torch.float64)
+
+            ccar_targets, ccar_details = ccar_batch_targets(
                 ccar, mu, targets, importance, outputs,
-                relabel_enabled=i >= args.relabel_epoch)
+                relabel_enabled=i >= args.relabel_epoch,
+                variant=args.ccar_variant,
+                prototype_weights=prototype_weights,
+                return_diagnostics=True)
+            relabel_epoch_metrics = merge_relabel_diagnostics(
+                relabel_epoch_metrics,
+                relabel_diagnostic_tensors(
+                    targets, clean_targets, ccar_details['relabel_mask'],
+                    ccar_details['predicted_labels'], num_classes=7))
 
             # Equations (13)-(14): scaled-logit CCAR plus AUEM and DSRUC.
-            loss = (ccar_loss(outputs, ccar_targets, importance)
-                    + auem_loss + dsruc_loss_value)
+            ccar_loss_value = ccar_loss(outputs, ccar_targets, importance)
+            loss = ccar_loss_value + auem_loss + dsruc_loss_value
 
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item()
+            ccar_loss_sum += ccar_loss_value.item()
+            auem_loss_sum += auem_loss.item()
+            dsruc_loss_sum += dsruc_loss_value.item()
             _, predicts = torch.max(outputs, 1)
             correct_num = torch.eq(predicts, targets).sum()
             correct_sum += correct_num.item()
 
         acc = correct_sum / float(train_sample_count)
         running_loss = running_loss / iter_cnt
+        component_losses = {
+            'ccar': ccar_loss_sum / iter_cnt,
+            'auem': auem_loss_sum / iter_cnt,
+            'dsruc': dsruc_loss_sum / iter_cnt,
+        }
+        prototype_norms = ccar.prototypes.detach().norm(dim=1).cpu().tolist()
+        prototype_drift = (
+            ccar.prototypes.detach() - prototypes_before
+        ).norm(dim=1).cpu().tolist()
+        epoch_weight_ess = torch.where(
+            prototype_weight_square_sum > 0,
+            prototype_weight_sum.square() / prototype_weight_square_sum,
+            torch.zeros_like(prototype_weight_sum))
+        relabel_epoch_metrics = relabel_diagnostics_to_python(
+            relabel_epoch_metrics)
+        relabel_epoch_metrics['precision'] = (
+            relabel_epoch_metrics['corrected_noisy_count']
+            / relabel_epoch_metrics['relabel_count']
+            if relabel_epoch_metrics['relabel_count'] else 0.0
+        )
+        relabel_epoch_metrics['noise_correction_recall'] = (
+            relabel_epoch_metrics['corrected_noisy_count']
+            / relabel_epoch_metrics['noisy_sample_count']
+            if relabel_epoch_metrics['noisy_sample_count'] else 0.0
+        )
         print('[Epoch %d] Training accuracy: %.4f. Loss: %.3f. LR: %.8g' % (
             i, acc, running_loss, epoch_lr))
+        print('[Epoch %d] Component losses: CCAR=%.3f AUEM=%.3f DSRUC=%.3f' % (
+            i, component_losses['ccar'], component_losses['auem'],
+            component_losses['dsruc']))
+        print('[Epoch %d] Relabel diagnostics: proposed=%d corrected=%d '
+              'false_clean=%d wrong_to_wrong=%d precision=%.4f recall=%.4f' % (
+                  i, relabel_epoch_metrics['relabel_count'],
+                  relabel_epoch_metrics['corrected_noisy_count'],
+                  relabel_epoch_metrics['false_correction_count'],
+                  relabel_epoch_metrics['wrong_to_wrong_count'],
+                  relabel_epoch_metrics['precision'],
+                  relabel_epoch_metrics['noise_correction_recall']))
 
         raw_res18_state = clone_state_dict_to_cpu(res18.state_dict())
         raw_fc_state = clone_state_dict_to_cpu(fc.state_dict())
@@ -690,19 +890,46 @@ def run_training():
             val_model_state = raw_res18_state
             val_fc_state = raw_fc_state
 
-        val_acc, val_loss = evaluate(val_loader)
+        val_metrics = evaluate(val_loader)
+        val_acc = val_metrics['accuracy']
+        val_loss = val_metrics['loss']
         if args.ema_decay > 0.0:
             res18.load_state_dict(raw_res18_state)
             fc.load_state_dict(raw_fc_state)
             validation_label = 'Validation (EMA)'
         else:
             validation_label = 'Validation'
-        print('[Epoch %d] %s accuracy:%.4f. Loss:%.3f' % (
-            i, validation_label, val_acc, val_loss))
+        print('[Epoch %d] %s accuracy:%.4f. Loss:%.3f. Macro-F1:%.4f. '
+              'Balanced accuracy:%.4f' % (
+                  i, validation_label, val_acc, val_loss,
+                  val_metrics['macro_f1'], val_metrics['balanced_accuracy']))
         if args.lr_scheduler == 'plateau':
             scheduler.step(val_loss)
         else:
             scheduler.step()
+
+        epoch_record = {
+            'epoch': i,
+            'seed': args.seed,
+            'ccar_variant': args.ccar_variant,
+            'learning_rate': epoch_lr,
+            'train': {
+                'accuracy_against_observed_labels': acc,
+                'loss': running_loss,
+                'component_losses': component_losses,
+            },
+            'relabel': relabel_epoch_metrics,
+            'prototype': {
+                'norm': prototype_norms,
+                'drift_l2': prototype_drift,
+                'update_count': prototype_update_count.cpu().tolist(),
+                'weight_sum': prototype_weight_sum.cpu().tolist(),
+                'epoch_weight_ess': epoch_weight_ess.cpu().tolist(),
+            },
+            'validation': val_metrics,
+        }
+        with open(metrics_path, 'a', encoding='utf-8') as metrics_file:
+            metrics_file.write(json.dumps(epoch_record, ensure_ascii=False) + '\n')
 
         if val_acc > best_acc:
             best_acc = val_acc
@@ -742,9 +969,26 @@ def run_training():
         best_checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         res18.load_state_dict(best_checkpoint['model_state_dict'])
         fc.load_state_dict(best_checkpoint['fc_state_dict'])
-        test_acc, test_loss = evaluate(test_loader)
-        print('Final official-test accuracy: {:.4f}. Loss: {:.3f}. Selected epoch: {}. Best validation accuracy: {:.4f}.'.format(
-            test_acc, test_loss, best_epoch, best_acc))
+        test_metrics = evaluate(test_loader, include_predictions=True)
+        predictions_path = os.path.join(save_folder, 'test_predictions.csv')
+        with open(predictions_path, 'w', encoding='utf-8', newline='') as output:
+            writer = csv.writer(output)
+            writer.writerow(('name', 'target_label', 'predicted_label'))
+            for index, target, prediction in zip(
+                    test_metrics.pop('indices'), test_metrics.pop('targets'),
+                    test_metrics.pop('predictions')):
+                writer.writerow((
+                    test_loader.dataset.names[index], target + 1,
+                    prediction + 1))
+        with open(os.path.join(save_folder, 'test_metrics.json'), 'w',
+                  encoding='utf-8') as output:
+            json.dump(test_metrics, output, ensure_ascii=False, indent=2)
+        print('Final official-test accuracy: {:.4f}. Loss: {:.3f}. '
+              'Macro-F1: {:.4f}. Balanced accuracy: {:.4f}. Selected epoch: '
+              '{}. Best validation accuracy: {:.4f}.'.format(
+                  test_metrics['accuracy'], test_metrics['loss'],
+                  test_metrics['macro_f1'],
+                  test_metrics['balanced_accuracy'], best_epoch, best_acc))
 
 
 if __name__ == "__main__":

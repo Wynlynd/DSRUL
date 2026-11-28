@@ -1,17 +1,18 @@
-# DSRUL Experiment C implementation notes
+# DSRUL Experiment D implementation notes
 
 This document records the active behavior of the public RAF-DB path. It
 separates implementation choices from claims that are explicit in the
 manuscript.
 
-Experiment C is based on V2 commit
-`dd772aef62e3904fb77e3a05b6648ad0290b85a2`. V2 was aligned against the
+Experiment D is based on Experiment C commit `ec77f6f`. The underlying V2
+implementation was aligned against the
 14-page manuscript PDF with SHA-256
 `DA235CB8344C22411137C4C84CFDBBB7238827122A72E6FB648C63D952D30184`.
 
-This branch intentionally changes the batch operation order after CCAR
-relabeling is enabled. It is a diagnostic experiment for self-inclusion bias,
-not a claim that the changed order is stated in the manuscript.
+This branch supports three explicit variants: A baseline (`update -> propose`),
+C preupdate (`propose -> update`), and D oracle-soft (C order with weights 1.0
+for clean-label matches and 0.5 by default for known noisy-label samples). D is
+a diagnostic upper-bound test, not a manuscript claim or deployable method.
 
 The training entrypoint prints the implementation version and complete method
 contract before loading data. Server logs therefore retain the experiment
@@ -85,10 +86,12 @@ cross-entropies are added with equal coefficient.
 
 ## CCAR
 
-Each class prototype is initialized from the first observed batch mean and is
-then updated using an exponential moving average. Classes absent from the
-current batch retain their previous prototype. Relabeling is disabled until the
-given class and at least one other class have initialized prototypes.
+Each class prototype is initialized from the first observed batch center and is
+then updated using an exponential moving average. A and C use an ordinary mean.
+D uses `sum(w_i * f_i) / sum(w_i)` within each observed-label class. A noisy
+sample is downweighted but never removed or reassigned to a clean/predicted
+class. Classes absent from the batch, or with zero total weight, retain their
+previous prototype.
 
 For original label `y`, CCAR computes Euclidean distance to the `y` prototype
 and to the closest initialized non-`y` prototype. The geometric score is:
@@ -113,8 +116,8 @@ label. When `Pmax > Pgt + threshold`, the predicted class becomes the target
 for the current batch's CCAR loss. The dataset label is not permanently
 modified, and prototype updates continue to use original labels.
 
-Before `relabel_epoch`, each batch updates the prototypes and retains the
-original targets. Starting at `relabel_epoch`, the order is:
+Before `relabel_epoch`, every variant updates prototypes and retains observed
+targets. Starting at `relabel_epoch`, A updates then proposes; C and D use:
 
 ```text
 1. Compute the proposal with the prototypes saved after previous batches.
@@ -155,11 +158,23 @@ training images. The official test split is evaluated only after the best
 validation checkpoint is reloaded, unless `--skip_test_eval` is specified.
 
 The split image names and split parameters are saved in `split_manifest.json`.
-Experiment C checkpoints save the resolved CLI configuration, checkpoint format
-version, implementation version, and method contract. The contract records the
-`propose_then_update_when_relabeling` CCAR order, so a V2 baseline full
-checkpoint is rejected for resume instead of silently changing methods.
+The independent training seed is saved in both manifests and the checkpoint.
+The method contract records the selected variant, order, weighting policy, and
+D's oracle weight, so incompatible full checkpoints are rejected on resume.
 `--pretrained` remains available for the restricted shape-compatible warm start.
 Resume requires scheduler state, restores EMA history when enabled, and rejects
-changes to behavior-defining CLI values. The repository does not currently save
-RNG/sampler state, metric history, or prediction files.
+changes to behavior-defining CLI values. RNG/sampler state is not saved, so a
+resumed run is not bitwise equivalent to an uninterrupted run. Epoch metrics
+are written to `metrics.jsonl`. On resume, records after the checkpoint epoch
+are removed and duplicate epochs retain only the latest record before new
+records are appended. Final class metrics and ordered predictions are written
+after the selected checkpoint is evaluated on the official test split.
+
+Clean training labels serve three isolated roles: validation split creation,
+detached relabel diagnostics in all variants, and D's explicit oracle prototype
+weights. They are never CCAR/DSRUC loss targets. The diagnostics report correct
+noisy-label corrections, false changes to clean samples, noisy-to-wrong changes,
+per-class counts, component losses, prototype drift/norm, update coverage,
+weight sums, and per-epoch weight ESS. The ESS is an update-stream proxy because
+batch centers are normalized before the prototype EMA; it is not the exact
+effective sample count of the final EMA prototype.

@@ -24,6 +24,59 @@ class CCARTests(unittest.TestCase):
         torch.testing.assert_close(restored.prototypes, ccar.prototypes)
         torch.testing.assert_close(restored.initialized, ccar.initialized)
 
+    def test_weighted_prototype_center_matches_manual_calculation(self):
+        ccar = ClusterContrastiveRelabeler(2, 2, momentum=0.0)
+        features = torch.tensor([[0., 2.], [4., 0.], [10., 10.]])
+        labels = torch.tensor([0, 0, 1])
+        weights = torch.tensor([1.0, 0.5, 0.0])
+
+        ccar.update(features, labels, weights=weights)
+
+        torch.testing.assert_close(
+            ccar.prototypes[0], torch.tensor([4. / 3., 4. / 3.]))
+        self.assertFalse(ccar.initialized[1].item())
+
+        unweighted = ClusterContrastiveRelabeler(2, 2, momentum=0.0)
+        all_ones = ClusterContrastiveRelabeler(2, 2, momentum=0.0)
+        unweighted.update(features, labels)
+        all_ones.update(features, labels, weights=torch.ones(3))
+        torch.testing.assert_close(
+            unweighted.prototypes, all_ones.prototypes)
+        torch.testing.assert_close(
+            unweighted.initialized, all_ones.initialized)
+
+    def test_weighted_update_validates_weights(self):
+        ccar = ClusterContrastiveRelabeler(2, 2)
+        features = torch.zeros(2, 2)
+        labels = torch.tensor([0, 1])
+        with self.assertRaisesRegex(ValueError, 'shape'):
+            ccar.update(features, labels, weights=torch.ones(2, 1))
+        with self.assertRaisesRegex(ValueError, 'non-negative'):
+            ccar.update(features, labels, weights=torch.tensor([1., -1.]))
+        with self.assertRaisesRegex(ValueError, 'finite'):
+            ccar.update(features, labels, weights=torch.tensor([1., float('nan')]))
+
+    def test_vectorized_weighted_updates_match_reference(self):
+        ccar = ClusterContrastiveRelabeler(4, 2, momentum=0.75)
+        ccar.update(
+            torch.tensor([[2., 0.], [0., 4.], [8., 8.]]),
+            torch.tensor([0, 1, 2]))
+        previous = ccar.prototypes.clone()
+
+        features = torch.tensor([
+            [4., 2.], [10., 6.], [2., 8.], [100., 100.]])
+        labels = torch.tensor([0, 0, 2, 3])
+        weights = torch.tensor([1.0, 0.5, 0.25, 0.0])
+        ccar.update(features, labels, weights=weights)
+
+        center_0 = (features[0] + 0.5 * features[1]) / 1.5
+        center_2 = features[2]
+        expected = previous.clone()
+        expected[0] = 0.75 * previous[0] + 0.25 * center_0
+        expected[2] = 0.75 * previous[2] + 0.25 * center_2
+        torch.testing.assert_close(ccar.prototypes, expected)
+        self.assertEqual(ccar.initialized.tolist(), [True, True, True, False])
+
     def test_geometry_and_importance_control_threshold(self):
         for device in self.devices():
             with self.subTest(device=device):
